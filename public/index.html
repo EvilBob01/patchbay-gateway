@@ -3,20 +3,27 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MCP Server Config Editor</title>
+    <title>Patchbay Gateway</title>
     <link rel="stylesheet" href="style.css">
-<link rel="icon" type="image/png" href="logo.png">
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="alternate icon" type="image/png" href="logo.png">
 </head>
 <body>
-    <header>
+    <header id="app-header">
         <div class="header-top-row">
-            <h1>MCP Proxy Admin</h1>
+            <h1 id="app-title">Patchbay Gateway</h1>
             <button id="logout-button" style="display: none;">Logout</button> 
         </div>
         <nav id="main-nav" style="display: none;">
              <button id="nav-servers" class="nav-button active">Servers</button>
+             <button id="nav-catalog" class="nav-button">Catalog</button>
              <button id="nav-tools" class="nav-button">Tools</button>
+             <button id="nav-users" class="nav-button">Users</button>
+             <button id="nav-mailboxes" class="nav-button">Mailboxes</button>
+             <button id="nav-deploykey" class="nav-button">Deploy Key</button>
+             <button id="nav-requests" class="nav-button">Requests</button>
              <button id="nav-terminal" class="nav-button">Terminal</button>
+             <button id="nav-help" class="nav-button">Help</button>
         </nav>
     </header>
 
@@ -39,24 +46,49 @@
 
         <!-- Server Configuration Section -->
         <div id="servers-section" class="admin-section" style="display: none;">
-            <h2>Server Configuration</h2>
-            <p>Edit the MCP server connections. Changes require a server restart to take effect.</p>
+            <h2>Servers</h2>
+            <p>A <strong>server</strong> is a backend this gateway connects to — one source of
+               capabilities, like an SSH host or another MCP service. Each server provides one or
+               more <strong>tools</strong> (see the Tools tab). The list below is every backend the
+               gateway aggregates and hands to your Claude clients as a single connection.</p>
+            <div class="help-callout">
+                <strong>New here?</strong> The easiest way to add a backend is the
+                <strong>Add Server (Wizard)</strong> button below — it walks you through it and can
+                even install this gateway's SSH key on the target host for you. Any change here
+                only goes live after you click <em>Save &amp; Reload</em>.
+            </div>
             <div id="server-list">
                 <!-- Server entries will be loaded here -->
             </div>
-            <button id="add-stdio-server-button" class="add-button">Add Stdio Server</button>
-            <button id="add-sse-server-button" class="add-button">Add SSE Server</button>
-            <button id="add-http-server-button" class="add-button">Add HTTP Server</button>
-            <button id="parse-server-config-button" class="add-button">Parse Config from JSON</button>
+            <button id="open-wizard-button" class="add-button">✨ Add Server (Wizard)</button>
+            <button id="open-catalog-button" class="add-button">📦 Browse Catalog</button>
+            <details class="advanced-add">
+                <summary>Advanced: add manually</summary>
+                <button id="add-stdio-server-button" class="add-button">Add Stdio Server</button>
+                <button id="add-sse-server-button" class="add-button">Add SSE Server</button>
+                <button id="add-http-server-button" class="add-button">Add HTTP Server</button>
+                <button id="parse-server-config-button" class="add-button">Parse Config from JSON</button>
+            </details>
             <hr>
-            <button id="save-config-button">Save & Reload Server Configuration</button>
+            <button id="save-config-button">Save &amp; Reload Server Configuration</button>
             <p id="save-status" class="status-message"></p>
         </div>
 
         <!-- Tool Configuration Section -->
         <div id="tools-section" class="admin-section" style="display: none;">
-             <h2>Tool Configuration</h2>
-             <p>Enable or disable specific tools provided by the connected servers. Changes require reloading the configuration to take effect.</p>
+             <h2>Tools</h2>
+             <p>A <strong>tool</strong> is a single capability a server provides — for example an
+                SSH backend exposes an <code>exec</code> tool. One server usually offers several
+                tools, and clients see them namespaced like <code>servername__toolname</code>.
+                Here you can turn individual tools on or off for everyone <em>without</em> removing
+                the whole server — handy for hiding something risky like <code>sudo-exec</code>.</p>
+             <div class="help-callout">
+                <strong>Ordering matters here.</strong> Unlike the Servers tab, the order and
+                grouping you set below is also the order tools are advertised to Claude clients.
+                Keeping it stable helps the model's prompt cache; putting the tools you use most
+                near the top doesn't hurt either. Anything you haven't placed is sorted
+                alphabetically after the rest.
+             </div>
              <div id="tool-list">
                  <!-- Tool entries will be loaded here -->
                  <p>Loading tools...</p>
@@ -67,6 +99,354 @@
                 <button id="reset-all-tool-overrides-button" class="cleanup-button" title="Clear all tool-specific configurations (overrides and enabled/disabled states)">Reset All Tool Overrides</button>
              </div>
              <p id="save-tool-status" class="status-message"></p>
+        </div>
+
+        <!-- Users / Token Management Section -->
+        <div id="users-section" class="admin-section" style="display: none;">
+            <h2>Users</h2>
+            <p>Each person who connects to this gateway gets their own <strong>token</strong> — a
+               secret string that acts as their key. There's no separate login for regular users;
+               the token in their config <em>is</em> the credential, so you can revoke one person's
+               access without affecting anyone else. Create a user below, then hand them a config
+               with <strong>Copy Desktop Config</strong> or the one-click <strong>Download
+               Installer</strong>.</p>
+            <form id="add-user-form">
+                <label for="new-username">Username:</label>
+                <input type="text" id="new-username" name="username" placeholder="e.g. alice" required>
+                <button type="submit" class="add-button">Create User</button>
+            </form>
+            <p id="add-user-status" class="status-message"></p>
+            <hr>
+            <div id="user-list">
+                <!-- User entries will be loaded here -->
+            </div>
+            <hr>
+            <div id="tool-policy-area">
+                <h3>Tool access policy</h3>
+                <p>Which users may see and call which tools. With no policy saved, everyone gets every
+                   enabled tool. Patterns are <code>*</code> or <code>server/tool</code>, where
+                   <code>*</code> is a wildcard (e.g. <code>forgejo/*</code>, <code>*/read-command</code>);
+                   <code>deny</code> beats <code>allow</code>. Keys: <code>default</code> (anyone not listed),
+                   <code>static</code> (the shared env key), <code>users</code> (by username) and named
+                   <code>roles</code>. Saved changes apply to the next request &mdash; no restart.</p>
+                <textarea id="tool-policy-editor" rows="14" spellcheck="false"></textarea>
+                <button id="save-tool-policy-button" type="button">Save Policy</button>
+                <p id="tool-policy-status" class="status-message"></p>
+            </div>
+            <hr>
+            <div id="config-gen-area">
+                <h3>Generate Claude Desktop config</h3>
+                <p>Click <strong>Copy Desktop Config</strong> on any user above to build a
+                   ready-to-paste block for their Claude Desktop app
+                   (Windows or Mac). Paste it into <em>Settings → Developer →
+                   Edit Config</em>. Their machine needs <strong>Node.js</strong> installed
+                   (<code>node -v</code> to check) and network access to this gateway.</p>
+                <label for="config-server-name">Server name (how it shows in their app):</label>
+                <input type="text" id="config-server-name" value="patchbay">
+                <label for="generated-config-preview">Generated config:</label>
+                <textarea id="generated-config-preview" rows="12" readonly placeholder="Click 'Copy Desktop Config' next to a user above…"></textarea>
+                <button id="copy-generated-config-button" type="button">Copy to Clipboard</button>
+                <p id="config-gen-status" class="status-message"></p>
+            </div>
+        </div>
+
+        <!-- Mailboxes Section -->
+        <div id="mailboxes-section" class="admin-section" style="display: none;">
+            <h2>Mailboxes</h2>
+            <p>Mailboxes registered here are what the <strong>mail</strong> MCP server (imap-mcp)
+               exposes to Claude -- one config, every account. Credentials are encrypted at rest
+               in this gateway's own config and are never shown back in this UI once saved.
+               Saving or deleting a mailbox restarts just the mail connector (a second or two);
+               every other tool on this gateway is unaffected.</p>
+            <form id="mail-account-form">
+                <h3 id="mail-account-form-title">Add a mailbox</h3>
+                <label for="mail-account-name">Name (used as the `account` id, e.g. "personal"):</label>
+                <input type="text" id="mail-account-name" name="name" placeholder="e.g. personal" required>
+                <label for="mail-imap-host">IMAP host:</label>
+                <input type="text" id="mail-imap-host" name="imapHost" placeholder="e.g. imap.gmail.com" required>
+                <label for="mail-imap-port">IMAP port:</label>
+                <input type="number" id="mail-imap-port" name="imapPort" value="993">
+                <label><input type="checkbox" id="mail-imap-secure" name="imapSecure" checked> Use TLS (uncheck only for STARTTLS/plain on a non-993 port)</label>
+                <label><input type="checkbox" id="mail-imap-insecure-tls" name="imapAllowInsecureTLS"> Skip certificate verification (fixes "self-signed certificate" errors -- only for a server you control)</label>
+                <label for="mail-user">IMAP username:</label>
+                <input type="text" id="mail-user" name="user" placeholder="e.g. you@gmail.com" required>
+                <label for="mail-password">IMAP password:</label>
+                <input type="password" id="mail-password" name="password" placeholder="Required" autocomplete="new-password">
+                <hr>
+                <label for="mail-smtp-host">SMTP host (optional -- leave blank to disable sending for this mailbox):</label>
+                <input type="text" id="mail-smtp-host" name="smtpHost" placeholder="e.g. smtp.gmail.com">
+                <label for="mail-smtp-port">SMTP port:</label>
+                <input type="number" id="mail-smtp-port" name="smtpPort" value="587">
+                <label><input type="checkbox" id="mail-smtp-secure" name="smtpSecure"> Use implicit TLS (checked for port 465, unchecked for STARTTLS on 587)</label>
+                <label><input type="checkbox" id="mail-smtp-insecure-tls" name="smtpAllowInsecureTLS"> Skip certificate verification for sending too (defaults to the IMAP setting above)</label>
+                <label for="mail-smtp-user">SMTP username (optional, defaults to the IMAP username):</label>
+                <input type="text" id="mail-smtp-user" name="smtpUser">
+                <label for="mail-smtp-password">SMTP password (optional, defaults to the IMAP password):</label>
+                <input type="password" id="mail-smtp-password" name="smtpPassword" placeholder="(defaults to the IMAP password)" autocomplete="new-password">
+                <label for="mail-from">From address (optional, defaults to the IMAP username):</label>
+                <input type="text" id="mail-from" name="mailFrom">
+                <div class="modal-actions">
+                    <button type="button" id="mail-account-test-button">Test Connection</button>
+                    <button type="submit" class="add-button">Save Mailbox</button>
+                    <button type="button" id="mail-account-cancel-edit" style="display: none;">Cancel Edit</button>
+                </div>
+                <p id="mail-account-test-status" class="status-message"></p>
+                <p id="mail-account-status" class="status-message"></p>
+            </form>
+            <hr>
+            <div id="mail-account-list">
+                <!-- Mailbox entries will be loaded here -->
+            </div>
+        </div>
+
+        <!-- Deploy Key Section -->
+        <div id="deploykey-section" class="admin-section" style="display: none;">
+            <h2>Deploy SSH Key to a New Host</h2>
+            <p>To connect to an SSH backend, this gateway signs in with its own SSH key — but the
+               target host has to <em>trust</em> that key first. This one-shot tool does that for
+               you: it connects to the host once with a password, appends the gateway's public key
+               to that account's <code>authorized_keys</code>, and immediately discards the
+               password (it's never stored or logged). After this, the gateway can reach the host
+               with no password. The Add Server wizard can run this step for you automatically.</p>
+            <p><strong>This gateway's public key:</strong></p>
+            <textarea id="gateway-public-key" rows="2" readonly></textarea>
+            <form id="deploy-key-form">
+                <label for="deploy-host">Host:</label>
+                <input type="text" id="deploy-host" name="host" placeholder="e.g. 192.0.2.20" required>
+                <label for="deploy-port">Port:</label>
+                <input type="number" id="deploy-port" name="port" value="22" required>
+                <label for="deploy-username">Username:</label>
+                <input type="text" id="deploy-username" name="username" placeholder="e.g. root" required>
+                <label for="deploy-password">Password:</label>
+                <input type="password" id="deploy-password" name="password" required>
+                <button type="submit" class="add-button">Deploy Key</button>
+            </form>
+            <p id="deploy-key-status" class="status-message"></p>
+        </div>
+
+        <!-- Connector Catalog (full page) -->
+        <div id="catalog-section" class="admin-section" style="display: none;">
+            <h2>Connector catalog</h2>
+            <p>Browse MCP connectors from the <strong>official registry</strong> and <strong>npm</strong>.
+               <em>Curated</em> entries install directly; <em>external</em> ones you
+               <strong>Approve &amp; add</strong> onto your curated list first — the governance gate.</p>
+            <div class="catalog-toolbar">
+                <input type="text" id="catalog-search" placeholder="Search connectors…" autocomplete="off">
+                <select id="catalog-filter">
+                    <option value="all">All sources</option>
+                    <option value="curated">Curated only</option>
+                    <option value="registry">Registry</option>
+                    <option value="npm">npm</option>
+                </select>
+                <button id="catalog-refresh" class="add-button" title="Refresh from sources">↻ Refresh</button>
+            </div>
+            <p id="catalog-status" class="wizard-hint">Loading…</p>
+            <div id="catalog-grid"></div>
+            <div id="catalog-pager" class="catalog-pager"></div>
+        </div>
+
+        <!-- Connector Requests Section -->
+        <div id="requests-section" class="admin-section" style="display: none;">
+            <h2>Connector requests</h2>
+            <p>When a gateway user asks Claude to <em>request a connector</em> (via the built-in
+               <code>connectors</code> tools), it shows up here for you to approve or deny.
+               <strong>Approving</strong> adds the connector to your curated allowlist so it can be
+               installed from <em>Servers → Browse Catalog</em>. Nothing runs on the gateway until
+               you approve <em>and</em> install it.</p>
+            <button id="refresh-requests-button" class="add-button">↻ Refresh</button>
+            <div id="requests-list" style="margin-top:1rem;"><p class="wizard-hint">Loading…</p></div>
+        </div>
+
+        <!-- Help / Documentation Section -->
+        <div id="help-section" class="admin-section" style="display: none;">
+            <h2>Help &amp; how-to</h2>
+            <p>This gateway bundles a bunch of separate backend servers into one connection for your
+               Claude apps. Below is how to run it, and a glossary of the jargon.</p>
+
+            <div class="help-callout">
+                <strong>The 30-second version:</strong> add a backend on the <em>Servers</em> tab,
+                create a person on the <em>Users</em> tab, then hand them the installer. They double-click
+                it, restart Claude Desktop, and every backend shows up as tools — no config editing on
+                their end.
+            </div>
+
+            <h3>What is this thing?</h3>
+            <p class="help-body">Normally each MCP backend (each SSH host, each service) would be its
+               own entry in every person's Claude Desktop config. That's a lot of duplicated setup and
+               a fat context window. This <strong>gateway</strong> connects to all of them once, on the
+               server side, and presents them to clients as a <em>single</em> MCP connection. Add a
+               backend here and it instantly appears for everyone — nobody has to touch their config.</p>
+
+            <h3>How to…</h3>
+
+            <div class="help-howto">
+                <h4>Add a new backend server</h4>
+                <ol>
+                    <li>Go to the <strong>Servers</strong> tab and click <strong>Add Server (Wizard)</strong>.</li>
+                    <li>Pick the type. For an SSH host, choose <em>SSH host</em> and enter its address, the
+                        SSH username, and port (usually 22).</li>
+                    <li>If the host doesn't trust this gateway's key yet, the wizard can install it for you
+                        (you'll enter that account's password once — it's used once and discarded).</li>
+                    <li>Review and click <strong>Finish</strong>. The wizard saves and reloads; the new
+                        backend's tools appear for connected clients.</li>
+                </ol>
+            </div>
+
+            <div class="help-howto">
+                <h4>Onboard a person (the easy way)</h4>
+                <ol>
+                    <li>On the <strong>Users</strong> tab, type their name and click <strong>Create User</strong>.</li>
+                    <li>Click <strong>Download Installer</strong> next to them. You get a small <code>.zip</code>.</li>
+                    <li>Send them the zip. They unzip it, double-click <strong>Install.bat</strong>, and restart
+                        Claude Desktop. Done — nothing else to install (Node is bundled).</li>
+                    <li>Need to cut someone off? Click <strong>Revoke</strong>. Their token stops working
+                        immediately; nobody else is affected.</li>
+                </ol>
+            </div>
+
+            <div class="help-howto">
+                <h4>Turn a tool off for everyone</h4>
+                <ol>
+                    <li>Go to the <strong>Tools</strong> tab.</li>
+                    <li>Untick the tool you want to hide (e.g. a <code>sudo-exec</code>).</li>
+                    <li>Save &amp; reload. The tool disappears from clients but the server stays connected.</li>
+                </ol>
+            </div>
+
+            <h3 id="glossary">Glossary</h3>
+            <dl class="glossary">
+                <dt>MCP (Model Context Protocol)</dt>
+                <dd>The open standard Claude uses to talk to external tools and data. An MCP
+                    <em>server</em> advertises capabilities; an MCP <em>client</em> (like Claude Desktop)
+                    calls them.</dd>
+
+                <dt>Gateway / proxy</dt>
+                <dd>This app. It's an MCP server to your clients and an MCP client to all the backends —
+                    aggregating many servers behind one connection.</dd>
+
+                <dt>Server (backend)</dt>
+                <dd>One capability source the gateway connects to — an SSH host, a database service, etc.
+                    Managed on the <em>Servers</em> tab.</dd>
+
+                <dt>Tool</dt>
+                <dd>A single callable function a server exposes (e.g. <code>exec</code>). One server →
+                    many tools. Clients see them as <code>servername__toolname</code>.</dd>
+
+                <dt>Prompt / Resource</dt>
+                <dd>Two other things an MCP server <em>can</em> expose besides tools: reusable prompt
+                    templates, and readable data resources. This gateway supports passing them through,
+                    though most backends here only provide tools.</dd>
+
+                <dt>Token</dt>
+                <dd>A per-user secret that authenticates a client to this gateway. It goes in the client's
+                    config URL as <code>?key=…</code>. Created and revoked on the <em>Users</em> tab.</dd>
+
+                <dt>stdio / SSE / HTTP</dt>
+                <dd>How the gateway talks to a backend. <strong>stdio</strong> launches a local command and
+                    talks over its input/output (used by SSH backends). <strong>SSE</strong> and
+                    <strong>HTTP</strong> connect to a backend that's already running at a URL.</dd>
+
+                <dt>ssh-mcp</dt>
+                <dd>The small program the gateway runs (as a stdio server) to turn an SSH host into MCP
+                    tools. Most backends here are ssh-mcp pointed at a host.</dd>
+
+                <dt>Deploy Key</dt>
+                <dd>Installing this gateway's SSH public key onto a host so the gateway can log in without
+                    a password. Done via the <em>Deploy Key</em> tab or automatically by the wizard.</dd>
+            </dl>
+        </div>
+
+        <!-- Add Server Wizard modal -->
+        <div id="wizard-modal" class="modal" style="display: none;">
+            <div class="modal-content wizard">
+                <span class="close-button" id="wizard-close">&times;</span>
+                <h2>Add a server</h2>
+                <div class="wizard-steps" id="wizard-steps">
+                    <span class="wstep active" data-step="1">1 · Type</span>
+                    <span class="wstep" data-step="2">2 · Connection</span>
+                    <span class="wstep" data-step="3">3 · Access</span>
+                    <span class="wstep" data-step="4">4 · Review</span>
+                </div>
+
+                <!-- Step 1: type + name -->
+                <div class="wizard-pane" data-pane="1">
+                    <label>What are you connecting to?</label>
+                    <div class="wizard-choices">
+                        <label class="choice"><input type="radio" name="wz-type" value="ssh" checked> <span><strong>SSH host</strong><br><small>Run commands on a Linux/Unix box (ssh-mcp)</small></span></label>
+                        <label class="choice"><input type="radio" name="wz-type" value="npm"> <span><strong>MCP package (npm)</strong><br><small>Run a published MCP server via npx — or use Browse Catalog</small></span></label>
+                        <label class="choice"><input type="radio" name="wz-type" value="sse"> <span><strong>SSE service</strong><br><small>An MCP server already running at a URL (SSE)</small></span></label>
+                        <label class="choice"><input type="radio" name="wz-type" value="http"> <span><strong>HTTP service</strong><br><small>An MCP server at a streamable-HTTP URL</small></span></label>
+                    </div>
+                    <label for="wz-name">Name for this server</label>
+                    <input type="text" id="wz-name" placeholder="e.g. web01 — lowercase, no spaces">
+                    <p class="wizard-hint">This is how it shows up in tool names (<code>name__tool</code>).</p>
+                </div>
+
+                <!-- Step 2: connection details -->
+                <div class="wizard-pane" data-pane="2" style="display:none;">
+                    <div class="wz-ssh-fields">
+                        <label for="wz-host">Host / IP</label>
+                        <input type="text" id="wz-host" placeholder="e.g. 192.0.2.10">
+                        <label for="wz-user">SSH username</label>
+                        <input type="text" id="wz-user" placeholder="e.g. root">
+                        <label for="wz-port">SSH port</label>
+                        <input type="number" id="wz-port" value="22">
+                        <label for="wz-key">SSH private key path (on the gateway)</label>
+                        <input type="text" id="wz-key">
+                    </div>
+                    <div class="wz-npm-fields" style="display:none;">
+                        <label for="wz-npm-package">npm package</label>
+                        <input type="text" id="wz-npm-package" placeholder="e.g. @modelcontextprotocol/server-memory">
+                        <p class="wizard-hint">Runs via <code>npx -y &lt;package&gt;</code> — no install step needed; npx fetches it on first run.</p>
+                        <label for="wz-npm-args">Arguments (optional, space-separated)</label>
+                        <input type="text" id="wz-npm-args" placeholder="e.g. /data/allowed-path">
+                        <label for="wz-npm-env">Environment variables (optional — one KEY=value per line)</label>
+                        <textarea id="wz-npm-env" rows="3" placeholder="API_TOKEN=xxxxx"></textarea>
+                    </div>
+                    <div class="wz-url-fields" style="display:none;">
+                        <label for="wz-url">Server URL</label>
+                        <input type="url" id="wz-url" placeholder="https://host:port/sse">
+                        <label for="wz-bearer">Bearer token (optional)</label>
+                        <input type="text" id="wz-bearer" placeholder="leave blank if none">
+                    </div>
+                </div>
+
+                <!-- Step 3: access / deploy key (ssh only) -->
+                <div class="wizard-pane" data-pane="3" style="display:none;">
+                    <div class="wz-ssh-access">
+                        <label>Does this host already trust the gateway's SSH key?</label>
+                        <div class="wizard-choices">
+                            <label class="choice"><input type="radio" name="wz-trust" value="yes" checked> <span><strong>Yes / not sure</strong><br><small>Skip — we'll just try to connect</small></span></label>
+                            <label class="choice"><input type="radio" name="wz-trust" value="no"> <span><strong>No — install it now</strong><br><small>Deploy the key with a one-time password</small></span></label>
+                        </div>
+                        <div id="wz-deploy-fields" style="display:none;">
+                            <p class="wizard-hint">Enter the password for <code id="wz-deploy-who">the account</code> just this once. It's used to install the key, then discarded.</p>
+                            <label for="wz-password">Password (one-time)</label>
+                            <input type="password" id="wz-password" autocomplete="off">
+                            <button type="button" id="wz-deploy-run" class="add-button">Install key now</button>
+                            <p id="wz-deploy-status" class="status-message"></p>
+                        </div>
+                    </div>
+                    <div class="wz-url-access" style="display:none;">
+                        <p class="help-body">This server type doesn't use an SSH key. Just make sure the gateway can reach the package registry / URL. Continue to review.</p>
+                    </div>
+                </div>
+
+                <!-- Step 4: review -->
+                <div class="wizard-pane" data-pane="4" style="display:none;">
+                    <label>Review — this entry will be added and saved:</label>
+                    <textarea id="wz-review" rows="10" readonly></textarea>
+                    <p class="wizard-hint">Clicking Finish saves the configuration and reloads the gateway.</p>
+                </div>
+
+                <div class="wizard-actions">
+                    <button type="button" id="wz-back" class="config-button" style="visibility:hidden;">← Back</button>
+                    <span class="wizard-spacer"></span>
+                    <button type="button" id="wz-next">Next →</button>
+                    <button type="button" id="wz-finish" class="installer-button" style="display:none;">Finish &amp; Save</button>
+                </div>
+                <p id="wizard-error" class="error-message"></p>
+            </div>
         </div>
 
         <!-- Modal for Parsing Server Config -->
@@ -123,8 +503,13 @@ OR
     </footer>
 
     <!-- Load specific modules first -->
+    <script src="layout.js"></script>
     <script src="servers.js"></script>
     <script src="tools.js"></script>
+    <script src="users.js"></script>
+    <script src="mail-accounts.js"></script>
+    <script src="deploy-key.js"></script>
+    <script src="wizard.js"></script>
     <!-- Load main script last -->
     <script src="script.js"></script>
 </body>

@@ -1,39 +1,53 @@
 {
-  "name": "mcp-proxy-server",
-  "version": "0.4.1",
-  "author": "ptbsare",
+  "name": "patchbay-gateway",
+  "version": "1.0.0",
+  "author": "Patchbay Gateway contributors",
+  "contributors": [
+    "ptbsare",
+    "Adam Wattis"
+  ],
   "license": "MIT",
-  "description": "An MCP proxy server that aggregates and serves multiple MCP resource servers through a single interface with stdio/sse support",
+  "description": "Patchbay Gateway: a multi-user MCP gateway that aggregates many MCP servers behind one endpoint, with per-user tokens, per-tool authorization, lethal-trifecta blocking, audit logging and rate limits",
   "private": true,
   "type": "module",
   "bin": {
-    "mcp-proxy-server": "./build/index.js"
+    "patchbay-gateway": "./build/index.js"
   },
   "files": [
     "build"
   ],
   "scripts": {
+    "patch:legacy-ssh": "node scripts/patch-ssh-mcp-legacy.mjs",
     "dev": "nodemon --watch 'src/**' --ext 'ts,json' --ignore 'src/**/*.spec.ts' --exec 'tsx src/index.ts'",
     "dev:sse": "nodemon --watch 'src/**' --ext 'ts,json' --ignore 'src/**/*.spec.ts' --exec 'tsx src/sse.ts'",
     "build": "tsc && node -e \"require('fs').chmodSync('build/index.js', '755')\"",
     "prepare": "npm run build",
     "watch": "tsc --watch",
-    "inspector": "npx @modelcontextprotocol/inspector build/index.js"
+    "inspector": "npx @modelcontextprotocol/inspector build/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node scripts/run-tests.mjs && node scripts/guard.mjs",
+    "guard": "node scripts/guard.mjs",
+    "hooks:install": "git config core.hooksPath scripts/git-hooks"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.12.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "@types/cors": "^2.8.17",
     "@types/express-session": "^1.18.1",
+    "archiver": "^7.0.1",
     "cors": "^2.8.5",
     "eventsource": "^4.0.0",
     "express": "^4.21.1",
     "express-session": "^1.18.1",
+    "imapflow": "^1.7.8",
     "node-pty": "^1.0.0",
+    "ssh2": "^1.17.0",
     "zod-to-json-schema": "^3.23.5"
   },
   "devDependencies": {
+    "@types/archiver": "^6.0.2",
     "@types/express": "^4.17.0",
     "@types/node": "^20.11.24",
+    "@types/ssh2": "^1.15.5",
     "nodemon": "^3.1.9",
     "tsx": "^4.19.2",
     "typescript": "^5.3.3"

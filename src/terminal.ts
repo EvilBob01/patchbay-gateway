@@ -25,14 +25,43 @@ const MAX_BUFFER_LENGTH = 200; // Max number of lines/chunks to buffer
 
 // --- PTY Management Functions ---
 
+/**
+ * Build the environment handed to a terminal PTY, with this gateway's own
+ * secrets removed.
+ *
+ * The admin terminal is a root shell by design, so this is not a privilege
+ * boundary -- an admin can read the service EnvironmentFile directly. What it
+ * does remove is the *casual* exposure: every `env` dump, every subprocess
+ * spawned from the terminal, and every screen-share of this tab would
+ * otherwise show ADMIN_PASSWORD, SESSION_SECRET and, more importantly, the
+ * ALLOWED_TOKENS / ALLOWED_KEYS that authenticate every MCP client on the
+ * fleet. Those are far more valuable than shell access to one container.
+ */
+export function buildTerminalEnv(source: NodeJS.ProcessEnv = process.env): { [key: string]: string } {
+    // Ends in a secret-ish word (SESSION_SECRET, ADMIN_PASSWORD, GITHUB_TOKEN...).
+    // Deliberately anchored at the end so path-style vars survive: SSH_PUBLIC_KEY_PATH
+    // is a filename, not a credential, and the terminal is more useful with it.
+    const SECRET_SUFFIX = /(^|_)(SECRET|SECRETS|PASSWORD|PASSWD|PASS|TOKEN|TOKENS|APIKEY|KEY|KEYS|CREDENTIALS)$/i;
+    // Whole namespaces that only ever hold gateway auth material.
+    const SECRET_PREFIX = /^(ADMIN_|ALLOWED_|SESSION_)/i;
+
+    const env: { [key: string]: string } = {};
+    for (const [key, value] of Object.entries(source)) {
+        if (value === undefined) continue;
+        if (SECRET_SUFFIX.test(key) || SECRET_PREFIX.test(key)) continue;
+        env[key] = value;
+    }
+    return env;
+}
+
 function startPtyProcess(): ActiveTerminal {
     const termId = crypto.randomUUID();
     const ptyProcess = pty.spawn(shell, [], {
         name: 'xterm-color',
         cols: 80, // Default size
         rows: 30,
-        cwd: process.env.HOME || process.cwd(), 
-        env: process.env as { [key: string]: string } 
+        cwd: process.env.HOME || process.cwd(),
+        env: buildTerminalEnv()
     });
 
     const terminal: ActiveTerminal = {

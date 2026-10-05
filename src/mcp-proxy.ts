@@ -15,6 +15,8 @@ import {
   ListResourceTemplatesRequestSchema,
   ListResourceTemplatesResultSchema,
   ResourceTemplate,
+  Prompt,
+  Resource,
   CompatibilityCallToolResultSchema,
   GetPromptResultSchema,
   McpError
@@ -22,10 +24,86 @@ import {
 import { createClients, ConnectedClient, reconnectSingleClient } from './client.js';
 import { logger } from './logger.js';
 import { Config, loadConfig, TransportConfig, isSSEConfig, isStdioConfig, isHttpConfig, ToolConfig, loadToolConfig, DEFAULT_SERVER_TOOLNAME_SEPERATOR } from './config.js';
-import { z } from 'zod';
 import * as eventsource from 'eventsource';
+import { readFile } from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+import { recordToolCall, recordRateLimit } from './audit.js';
+import { UNKNOWN_IDENTITY, type CallerIdentity } from './identity.js';
+import { currentPolicy, AUTHZ_DENIED_CODE, type AuthzDecision } from './policy.js';
+import { checkTrifecta, configureTrifecta, summarizeClassification, selfCompletingTools, TRIFECTA_BLOCKED_CODE, type TrifectaDecision } from './trifecta.js';
+import { shapeToolResult } from './tool-result.js';
+import { RATE_LIMIT_ENABLED, RATE_LIMITED_CODE, TOOL_CALL_LIMIT, toolCallLimiter, rateKey, rateLimitErrorData, rateLimitMessage } from './ratelimit.js';
 
 global.EventSource = eventsource.EventSource;
+
+// --- Caller identity, keyed by MCP transport session id -------------------
+//
+// sse.ts resolves the credential on each request and registers the resulting
+// identity here against the transport's session id; request handlers read it
+// back out of `extra.sessionId`.
+//
+// This is only sound because each client session gets its own Server instance
+// (see buildServerInstance). Before that, `extra.sessionId` was derived from a
+// single shared `_transport`, so this lookup would have resolved every caller
+// to whichever session connected last -- i.e. it would have attributed calls to
+// the wrong user. Do not reintroduce a shared server.
+const sessionIdentities = new Map<string, CallerIdentity>();
+
+export const setSessionIdentity = (sessionId: string, identity: CallerIdentity): void => {
+  sessionIdentities.set(sessionId, identity);
+};
+
+/** Identity bound to a session, if any. Used by sse.ts for the legacy /message route. */
+export const getSessionIdentity = (sessionId: string): CallerIdentity | undefined => sessionIdentities.get(sessionId);
+
+export const clearSessionIdentity = (sessionId: string): void => {
+  sessionIdentities.delete(sessionId);
+};
+
+/**
+ * Identity of the caller behind a request. Falls back to the explicit
+ * UNKNOWN_IDENTITY rather than undefined, so the audit trail can never record a
+ * null caller or crash trying to read one.
+ */
+const identityFor = (extra: any): CallerIdentity => {
+  const sid = extra?.sessionId as string | undefined;
+  return (sid && sessionIdentities.get(sid)) || UNKNOWN_IDENTITY;
+};
+
+const __mcpProxyDirname = path.dirname(fileURLToPath(import.meta.url));
+// Cosmetic admin-UI layout, reused here as the canonical tool ordering.
+const UI_LAYOUT_PATH = path.resolve(__mcpProxyDirname, '..', 'config', 'ui_layout.json');
+
+/**
+ * Build a rank map (toolKey -> position) from the admin UI's saved Tools layout.
+ * Tools are emitted from tools/list in this order, which (a) lets the admin control
+ * how tools are presented to clients from the Tools tab, and (b) keeps the ordering
+ * STABLE across restarts. Without this, order follows backend connection order --
+ * which varies run to run and needlessly busts LLM prompt caches.
+ * Anything not in the layout (or if no layout exists) falls back to alphabetical.
+ */
+async function loadToolOrderRanks(): Promise<Map<string, number>> {
+  const ranks = new Map<string, number>();
+  try {
+    const layout = JSON.parse(await readFile(UI_LAYOUT_PATH, 'utf-8'));
+    const page = layout?.tools;
+    if (!page) return ranks;
+    let i = 0;
+    for (const g of (Array.isArray(page.groups) ? page.groups : [])) {
+      for (const k of (Array.isArray(g?.keys) ? g.keys : [])) {
+        if (typeof k === 'string' && !ranks.has(k)) ranks.set(k, i++);
+      }
+    }
+    for (const k of (Array.isArray(page.ungrouped) ? page.ungrouped : [])) {
+      if (typeof k === 'string' && !ranks.has(k)) ranks.set(k, i++);
+    }
+  } catch {
+    // No layout saved yet (or unreadable) -- alphabetical fallback still applies.
+  }
+  return ranks;
+}
 
 // --- Shared State ---
 // Keep track of connected clients and the maps globally within this module
@@ -51,6 +129,17 @@ const defaultProxySettingsFull: Required<NonNullable<Config['proxy']>> = {
 };
 
 let currentProxyConfig: Required<NonNullable<Config['proxy']>> = { ...defaultProxySettingsFull }; // Initialize with full defaults
+
+/**
+ * Serialise a server config with object keys sorted at every level, so two
+ * configs that differ only in key order (e.g. re-saved by the admin UI) compare
+ * equal. Array order is preserved -- `args` order is significant.
+ */
+const stableConfigString = (value: unknown): string =>
+    JSON.stringify(value, (_key, v) =>
+        v && typeof v === 'object' && !Array.isArray(v)
+            ? Object.fromEntries(Object.keys(v).sort().map(k => [k, (v as Record<string, unknown>)[k]]))
+            : v);
 
 // --- Function to update backend connections and maps ---
 export const updateBackendConnections = async (newServerConfig: Config, newToolConfig: ToolConfig) => {
@@ -82,10 +171,18 @@ export const updateBackendConnections = async (newServerConfig: Config, newToolC
     const newClientKeys = new Set(Object.keys(activeServersConfigLocal));
     const currentClientKeys = new Set(currentConnectedClients.map(c => c.name));
 
-    const clientsToRemove = currentConnectedClients.filter(c => !newClientKeys.has(c.name));
-    const clientsToKeep = currentConnectedClients.filter(c => newClientKeys.has(c.name));
-    const keysToAdd = Object.keys(activeServersConfigLocal).filter(key => !currentClientKeys.has(key));
+    // A server whose config was edited (command, args, env, url, ...) must be
+    // torn down and reconnected, or the edit silently does nothing until restart.
+    // Every other still-configured client is kept untouched.
+    const clientsToReplace = currentConnectedClients.filter(c =>
+        newClientKeys.has(c.name) && stableConfigString(c.config) !== stableConfigString(activeServersConfigLocal[c.name]));
+    const replaceKeys = new Set(clientsToReplace.map(c => c.name));
 
+    const clientsToRemove = currentConnectedClients.filter(c => !newClientKeys.has(c.name) || replaceKeys.has(c.name));
+    const clientsToKeep = currentConnectedClients.filter(c => newClientKeys.has(c.name) && !replaceKeys.has(c.name));
+    const keysToAdd = Object.keys(activeServersConfigLocal).filter(key => !currentClientKeys.has(key) || replaceKeys.has(key));
+
+    logger.log(`Clients to replace (config changed): ${clientsToReplace.map(c => c.name).join(', ') || 'None'}`);
     logger.log(`Clients to remove: ${clientsToRemove.map(c => c.name).join(', ') || 'None'}`);
     logger.log(`Clients to keep: ${clientsToKeep.map(c => c.name).join(', ') || 'None'}`);
     logger.log(`Server keys to add: ${keysToAdd.join(', ') || 'None'}`);
@@ -175,10 +272,23 @@ export const updateBackendConnections = async (newServerConfig: Config, newToolC
          }
     }
     logger.log(`  Updated prompt map with ${promptToClientMap.size} prompts.`);
+
+    // Lethal-trifecta classification follows the backend set (kinds are detected
+    // from each backend's command line); log how the current tools classify.
+    configureTrifecta(currentActiveServersConfig, currentSeparator);
+    const classified = Array.from(toolToClientMap.values()).map(
+        ({ client, toolInfo }) => ({ backend: client.name, tool: toolInfo.name }));
+    const trifectaCfg = (await currentPolicy()).trifecta;
+    logger.log(summarizeClassification(classified, trifectaCfg));
+    const selfCompleting = selfCompletingTools(classified, trifectaCfg);
+    if (selfCompleting.length) {
+        logger.warn(`trifecta: ${selfCompleting.length} tool(s) are classified on all three axes and will be refused in every session ` +
+            `unless an allow rule exempts the caller; reclassify them in the trifecta section of tool_policy.json: ${selfCompleting.join(', ')}`);
+    }
     logger.log("Backend connections update finished.");
 };
 
-async function refreshBackendConnection(serverKey: string, serverConfig: TransportConfig): Promise<boolean> {
+export async function refreshBackendConnection(serverKey: string, serverConfig: TransportConfig): Promise<boolean> {
   logger.log(`Attempting to refresh backend connection for server: ${serverKey}`);
   const existingClientIndex = currentConnectedClients.findIndex(c => c.name === serverKey);
   let oldCleanup: (() => Promise<void>) | undefined = undefined;
@@ -374,10 +484,46 @@ export const createServer = async () => {
 
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms)); // Define sleep
 
-  // Create the main proxy server instance
+  // Cleanup function needs to handle the *current* list of clients
+  const cleanup = async () => {
+    logger.log(`Cleaning up ${currentConnectedClients.length} connected clients...`);
+    await Promise.all(currentConnectedClients.map(async ({ name, cleanup: clientCleanup }) => {
+        try {
+            await clientCleanup();
+             logger.log(`  Cleaned up client: ${name}`);
+        } catch(error: any) {
+             logger.error(`  Error cleaning up client ${name}: ${error.message}`);
+        }
+    }));
+    currentConnectedClients = []; // Clear the list after cleanup
+  };
+
+  // Backend connections are process-wide and shared; the *protocol* server is not.
+  // Callers get a factory instead of a single instance -- see buildServerInstance.
+  return { cleanup, createServerInstance: () => buildServerInstance(sleep) };
+};
+
+/**
+ * Build a fresh Server (protocol) instance with every request handler registered.
+ *
+ * One of these per client session. They deliberately share the module-level
+ * backend state (currentConnectedClients, toolToClientMap, ...) -- the backends
+ * are a process-wide resource -- but each gets its own Protocol, and therefore
+ * its own `_transport`.
+ *
+ * That last part is the whole point. Protocol.connect() assigns `this._transport`
+ * and _onrequest() replies via `this._transport`, so a *shared* Server connected
+ * to a second transport silently starts sending the first client's responses to
+ * the second client. On @modelcontextprotocol/sdk 1.12.0 there is no guard against
+ * this at all (later versions throw "Already connected to a transport" instead),
+ * so the failure mode here was silent cross-session response delivery rather than
+ * an error. Reproduced in repro-session-bleed.mjs before this change.
+ */
+function buildServerInstance(sleep: (ms: number) => Promise<unknown>) {
+  // Create the per-session proxy server instance
   const server = new Server(
     {
-      name: "mcp_proxy_server",
+      name: "patchbay-gateway",
       version: "1.0.0", // Consider updating version dynamically
     },
     {
@@ -393,13 +539,24 @@ export const createServer = async () => {
   // These handlers now rely on the maps populated by updateBackendConnections
   // Note: InitializeRequest is handled by the SDK's Server default behavior.
 
-  server.setRequestHandler(ListToolsRequestSchema, async (request) => {
+  server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
     logger.log("Received tools/list request - applying overrides from config");
-    const enabledTools: Tool[] = [];
+    // Hide what the caller may not call. This is presentation only -- the
+    // tools/call handler re-checks, because a client can call any name it likes.
+    const identity = identityFor(extra);
+    const policy = await currentPolicy();
+    let hidden = 0;
+    // Collect alongside the ORIGINAL qualified name -- that's the key the admin UI
+    // layout is stored under, and what we sort by (the exposed name may be overridden).
+    const collected: { key: string; tool: Tool }[] = [];
     // Access the globally stored tool config which includes overrides
     const toolOverrides = currentToolConfig.tools || {};
 
     for (const [originalQualifiedName, { client: connectedClient, toolInfo }] of toolToClientMap.entries()) {
+        if (policy.configured && !policy.decide({ identity, backend: connectedClient.name, tool: toolInfo.name }).allowed) {
+            hidden++;
+            continue;
+        }
         const overrideSettings = toolOverrides[originalQualifiedName];
 
         // Determine the final name and description to expose
@@ -408,17 +565,38 @@ export const createServer = async () => {
         const exposedDescription = overrideSettings?.exposedDescription || toolInfo.description;
 
         // Construct the Tool object for the response
-        enabledTools.push({
-            name: exposedName, // Use the final exposed name
-            description: exposedDescription, // Use the final exposed description
-            inputSchema: toolInfo.inputSchema, // Schema is never overridden
+        collected.push({
+            key: originalQualifiedName,
+            tool: {
+                name: exposedName, // Use the final exposed name
+                description: exposedDescription, // Use the final exposed description
+                inputSchema: toolInfo.inputSchema, // Schema is never overridden
+            },
         });
     }
-    logger.log(`Returning ${enabledTools.length} enabled tools with applied overrides.`);
+
+    // Deterministic ordering: admin-defined layout first, then anything else
+    // alphabetically. Plain code-unit compare (not localeCompare) so the result
+    // doesn't depend on the host's locale.
+    const ranks = await loadToolOrderRanks();
+    const UNRANKED = Number.MAX_SAFE_INTEGER;
+    collected.sort((a, b) => {
+        const ra = ranks.has(a.key) ? ranks.get(a.key)! : UNRANKED;
+        const rb = ranks.has(b.key) ? ranks.get(b.key)! : UNRANKED;
+        if (ra !== rb) return ra - rb;
+        return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+    });
+
+    const enabledTools: Tool[] = collected.map(c => c.tool);
+    logger.log(`Returning ${enabledTools.length} enabled tools with applied overrides (ordered: ${ranks.size} from layout, rest alphabetical)${policy.configured ? `; ${hidden} hidden by tool policy for ${identity.kind}:${identity.username}` : ''}.`);
     return { tools: enabledTools };
   });
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  // Filled in as the call is resolved, so an audit line can still name the tool
+  // key and backend for a call that resolved and then failed.
+  interface ToolCallAuditCtx { toolKey?: string; backend?: string; authz?: AuthzDecision; trifecta?: TrifectaDecision['detail'] }
+
+  const forwardToolCall = async (request: any, audit: ToolCallAuditCtx, identity: CallerIdentity, sessionId?: string): Promise<any> => {
     const { name: requestedExposedName, arguments: args } = request.params;
     let originalQualifiedName: string | undefined;
     let mapEntry: { client: ConnectedClient, toolInfo: Tool } | undefined;
@@ -449,6 +627,32 @@ export const createServer = async () => {
     // Now we have the correct mapEntry and the originalQualifiedName
     let { client: clientForTool, toolInfo } = mapEntry; // toolInfo here is the correct one from the found mapEntry
     const originalToolNameForBackend = toolInfo.name; // The actual name the backend server expects (from the original toolInfo)
+
+    audit.toolKey = originalQualifiedName;
+    audit.backend = clientForTool.name;
+
+    // Authorization. Enforced here, not only in tools/list: hiding a tool is not
+    // a boundary, since a client can call any name it knows. Decided on the
+    // ORIGINAL backend and tool names, so exposed-name overrides cannot be used
+    // to step around a rule.
+    const policy = await currentPolicy();
+    const decision = policy.decide({ identity, backend: clientForTool.name, tool: originalToolNameForBackend, sessionId });
+    audit.authz = decision;
+    if (!decision.allowed) {
+        logger.warn(`Denied tools/call '${requestedExposedName}' (${originalQualifiedName}) for ${identity.kind}:${identity.username} -- ${decision.rule}: ${decision.reason}`);
+        throw new McpError(AUTHZ_DENIED_CODE, `Tool "${requestedExposedName}" is not permitted for this caller.`);
+    }
+
+    // Lethal trifecta (trifecta.ts): authorization says this caller may use the
+    // tool; this says whether this *session* may use it now, given what it has
+    // already touched. After authz, so a call the caller may not make at all is
+    // never counted against the session. Before forwarding, so a refused call
+    // never reaches the backend. Synchronous from here to the check-and-record.
+    const trifecta = checkTrifecta(sessionId, identity, clientForTool.name, originalToolNameForBackend, policy.trifecta);
+    audit.trifecta = trifecta.detail;
+    if (!trifecta.allowed) {
+        throw new McpError(TRIFECTA_BLOCKED_CODE, trifecta.message || 'Blocked by lethal-trifecta policy', { trifecta: trifecta.detail });
+    }
 
     // --- Retry Logic ---
     // Use HTTP retry settings for SSE as a fallback for retry count and delay
@@ -490,6 +694,7 @@ export const createServer = async () => {
                         }
                         clientForTool = newMapEntry.client;
                         toolInfo = newMapEntry.toolInfo;
+                        audit.backend = clientForTool.name;
                     } else {
                         logger.error(`SSE Reconnection to server '${clientForTool.name}' failed.`);
                         throw new McpError(-32000, `SSE Reconnection to server '${clientForTool.name}' failed for tool '${requestedExposedName}'.`);
@@ -554,7 +759,65 @@ export const createServer = async () => {
     logger.error(errorMessage, lastError);
     // Ensure a structured McpError is returned to the client
     throw new McpError(lastError?.code || -32000, errorMessage, lastError?.data);
-});
+  };
+
+  // Every tools/call is recorded, success or failure. recordToolCall is
+  // fire-and-forget and swallows its own errors, so auditing cannot fail a call
+  // -- but it is called on both paths before the result or error leaves here.
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    const audit: ToolCallAuditCtx = {};
+    const identity = identityFor(extra);
+    const sessionId = (extra as any)?.sessionId as string | undefined;
+    const startedAt = Date.now();
+    const toolName = request.params.name;
+
+    // Per-identity throttle (ratelimit.ts), before authorization and before
+    // anything reaches a backend. Recorded as an `event: 'rate-limit'` audit
+    // line (coalesced) rather than a tools/call line, so a throttled loop
+    // cannot flood the audit log.
+    if (RATE_LIMIT_ENABLED) {
+      const key = rateKey(identity, sessionId);
+      const decision = toolCallLimiter.take(key);
+      if (!decision.allowed) {
+        const data = rateLimitErrorData('tools/call', decision, TOOL_CALL_LIMIT);
+        recordRateLimit({
+          identity, sessionId, scope: 'tools/call', key, tool: toolName,
+          errorCode: RATE_LIMITED_CODE, retryAfterMs: decision.retryAfterMs,
+          burst: data.burst, perMinute: data.perMinute,
+        });
+        throw new McpError(RATE_LIMITED_CODE, rateLimitMessage(identity, data), data);
+      }
+    }
+
+    try {
+      const result = await forwardToolCall(request, audit, identity, sessionId);
+      // A backend can report failure in-band via isError rather than throwing.
+      const inBandError = result?.isError === true;
+      recordToolCall({
+        identity, sessionId, tool: toolName, toolKey: audit.toolKey, backend: audit.backend,
+        ok: !inBandError,
+        durationMs: Date.now() - startedAt,
+        authz: audit.authz,
+        ...(audit.trifecta ? { trifecta: audit.trifecta } : {}),
+        ...(inBandError ? { errorMessage: 'backend returned isError' } : {}),
+        arguments: request.params.arguments,
+      });
+      // Last, so the audit record above describes what the backend returned.
+      return shapeToolResult(result, identity);
+    } catch (err: any) {
+      recordToolCall({
+        identity, sessionId, tool: toolName, toolKey: audit.toolKey, backend: audit.backend,
+        ok: false,
+        durationMs: Date.now() - startedAt,
+        authz: audit.authz,
+        ...(audit.trifecta ? { trifecta: audit.trifecta } : {}),
+        errorCode: err?.code,
+        errorMessage: err?.message,
+        arguments: request.params.arguments,
+      });
+      throw err;
+    }
+  });
 
 // ... rest of the file ...
 
@@ -595,13 +858,12 @@ export const createServer = async () => {
   server.setRequestHandler(ListPromptsRequestSchema, async (request) => {
     logger.log("Received prompts/list request - returning from cached map");
     // Directly use the pre-populated map
-    const allPrompts: z.infer<typeof ListPromptsResultSchema>['prompts'] = [];
+    const allPrompts: Prompt[] = [];
      for (const [name, connectedClient] of promptToClientMap.entries()) {
          // Similar simplification as tools/list
          allPrompts.push({
              name: name, // The map key is the original name
              description: `[${connectedClient.name}] Prompt (details omitted in list)`,
-             inputSchema: {},
          });
         }
        logger.log(`Returning ${allPrompts.length} prompts from map.`);
@@ -613,14 +875,13 @@ export const createServer = async () => {
 
    server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
        logger.log("Received resources/list request - returning from cached map");
-       const allResources: z.infer<typeof ListResourcesResultSchema>['resources'] = [];
+       const allResources: Resource[] = [];
        for (const [uri, connectedClient] of resourceToClientMap.entries()) {
            // Simplified response
            allResources.push({
                uri: uri,
                name: `[${connectedClient.name}] Resource (details omitted in list)`,
                description: undefined,
-               methods: [], // Cannot know methods without asking client
            });
        }
        logger.log(`Returning ${allResources.length} resources from map.`);
@@ -708,21 +969,5 @@ export const createServer = async () => {
     };
   });
 
-  // Cleanup function needs to handle the *current* list of clients
-  const cleanup = async () => {
-    logger.log(`Cleaning up ${currentConnectedClients.length} connected clients...`);
-    await Promise.all(currentConnectedClients.map(async ({ name, cleanup: clientCleanup }) => {
-        try {
-            await clientCleanup();
-             logger.log(`  Cleaned up client: ${name}`);
-        } catch(error: any) {
-             logger.error(`  Error cleaning up client ${name}: ${error.message}`);
-        }
-    }));
-    currentConnectedClients = []; // Clear the list after cleanup
-  };
-
-  // Return the server instance and the cleanup function
-  // We don't return connectedClients anymore as it's managed internally
-  return { server, cleanup };
-};
+  return server;
+}

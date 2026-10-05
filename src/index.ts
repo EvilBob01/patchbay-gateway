@@ -6,7 +6,10 @@ import { createServer } from "./mcp-proxy.js";
 
 async function main() {
   const transport = new StdioServerTransport();
-  const { server, cleanup } = await createServer();
+  const { cleanup, createServerInstance } = await createServer();
+  // stdio is inherently single-session, but it takes an instance from the same
+  // factory as the HTTP paths so there is only one way to build a server.
+  const server = createServerInstance();
 
   await server.connect(transport);
 

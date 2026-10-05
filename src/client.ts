@@ -110,14 +110,11 @@ const createClient = (name: string, transportConfig: TransportConfig): { client:
    }
 
    const client = new Client({
-     name: 'mcp-proxy-client',
+     name: 'patchbay-gateway',
      version: '1.0.0',
    }, {
-     capabilities: {
-       prompts: {},
-       resources: { subscribe: true },
-       tools: {}
-     }
+     // prompts/resources/tools are server capabilities; a client has none of them to declare.
+     capabilities: {}
    });
 
    return { client, transport, transportType }
@@ -269,10 +266,10 @@ export async function reconnectSingleClient(
   }
 
   const newSdkClient = new Client({
-    name: 'mcp-proxy-client-reconnect',
+    name: 'patchbay-gateway-reconnect',
     version: '1.0.1',
   }, {
-    capabilities: { prompts: {}, resources: { subscribe: true }, tools: {} }
+    capabilities: {}
   });
 
   try {

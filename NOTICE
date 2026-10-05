@@ -1,0 +1,21 @@
+Patchbay Gateway
+Copyright (c) 2026 Patchbay Gateway contributors
+Licensed under the MIT License (see LICENSE).
+
+Patchbay Gateway is a fork of mcp-proxy-server by ptbsare
+  https://github.com/ptbsare/mcp-proxy-server
+which was itself refactored from mcp-proxy-server by Adam Wattis
+  https://github.com/adamwattis/mcp-proxy-server
+Both are MIT licensed; their copyright notices are kept in LICENSE.
+
+Work borrowed from other forks of ptbsare/mcp-proxy-server, with thanks:
+
+  willscottuk/mcp-proxy-server (MIT)
+    d12590dc  security audit of upstream; its pre-auth findings are fixed here
+    75d535b   diffing backend config on reload (adapted, not copied)
+    190093a1  merging adjacent text blocks in tool results (ported, behind a
+              toggle; see src/tool-result.ts)
+
+  matuszeg/mcp-proxy-server (MIT)
+    40d702cd  one Server instance per client session (the idea; our fix is
+              independent and targets SDK 1.30)

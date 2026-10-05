@@ -38,6 +38,8 @@ function renderServerConfig(config) {
          renderServerEntry(key, servers[key]);
     });
      addInstallButtonListeners(); // Ensure listeners are (re-)added after full render
+     // Cosmetic: apply saved ordering/groups + search/drag toolbar (does not affect MCP).
+     if (window.LayoutEnhancer) window.LayoutEnhancer.apply('servers');
 }
 
 function renderServerEntry(key, serverConf, startExpanded = false) {
@@ -100,7 +102,7 @@ function renderServerEntry(key, serverConf, startExpanded = false) {
         
         detailsHtml += `
             <div><label>Command:</label><input type="text" class="server-command-input" value="${serverConf.command || ''}" required></div>
-            <div><label>Arguments (comma-separated):</label><input type="text" class="server-args-input" value="${(serverConf.args || []).join(', ')}"></div>
+            <div><label>Arguments (one per line; commas and quotes are preserved):</label><textarea class="server-args-input">${escapeHtml((serverConf.args || []).join('\n'))}</textarea></div>
             <div>
                 <label>Environment Variables:</label>
                 <div class="env-vars-container"></div>
@@ -358,7 +360,7 @@ function initializeServerSaveListener() {
                 if (!serverData.command) { isValid = false; errorMsg = `Command required for Stdio server "${newKey}".`; commandInput.style.border = '1px solid red'; }
                 else { commandInput.style.border = ''; }
                 const argsString = argsInput.value.trim();
-                serverData.args = argsString ? argsString.split(',').map(arg => arg.trim()).filter(arg => arg) : [];
+                serverData.args = argsString ? argsString.split(/\r?\n/).map(arg => arg.trim()).filter(arg => arg) : [];
                 serverData.env = {};
                 if (envVarsContainer) {
                     envVarsContainer.querySelectorAll('.env-var-row').forEach(row => {

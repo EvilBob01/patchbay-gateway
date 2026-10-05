@@ -16,3 +16,23 @@ MCP-protocol.txt
 tools/**
 config/mcp_server.json
 config/tool_config.json
+# Per-gateway curated allowlist + end-user connector requests (runtime state)
+config/catalog.json
+config/requests.json
+config/icon-cache/
+# Cosmetic admin-UI layout (ordering + groups), per-gateway runtime state
+config/ui_layout.json
+# Per-user tokens created via the admin UI -- live secrets, never commit.
+config/users.json
+# Per-gateway tool access policy (who may use which tools) -- runtime state.
+config/tool_policy.json
+config/tool_policy.json.tmp-*
+# Mailbox (imap-mcp) accounts store + its encryption key -- live secrets, never commit.
+config/mail_accounts.json
+config/.mail_accounts_key
+
+# Local backups taken before manual patches -- never commit
+*.bak-*
+
+# Private leak-guard denylist (docs/guard.md) -- never commit
+.patchbay-denylist

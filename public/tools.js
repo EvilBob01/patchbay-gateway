@@ -100,6 +100,8 @@ function renderTools() {
      if (toolListDiv.innerHTML === '') {
          toolListDiv.innerHTML = '<p>No tools discovered or configured.</p>';
      }
+     // Cosmetic: apply saved ordering/groups + search/drag toolbar (does not affect MCP).
+     if (window.LayoutEnhancer) window.LayoutEnhancer.apply('tools');
 }
 
 function renderToolEntry(toolKey, toolDefinition, toolConfig, isConfigOnly = false, isServerActive = true) { // Added isServerActive

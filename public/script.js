@@ -17,7 +17,13 @@ const loginForm = document.getElementById('login-form');
 const loginError = document.getElementById('login-error');
 const navServersButton = document.getElementById('nav-servers');
 const navToolsButton = document.getElementById('nav-tools');
+const navUsersButton = document.getElementById('nav-users');
+const navMailboxesButton = document.getElementById('nav-mailboxes');
+const navDeployKeyButton = document.getElementById('nav-deploykey');
 const navTerminalButton = document.getElementById('nav-terminal');
+const navHelpButton = document.getElementById('nav-help');
+const navRequestsButton = document.getElementById('nav-requests');
+const navCatalogButton = document.getElementById('nav-catalog');
 const logoutButton = document.getElementById('logout-button');
 const serversSection = document.getElementById('servers-section');
 const toolsSection = document.getElementById('tools-section');
@@ -201,6 +207,13 @@ const handleLoginSuccess = async () => {
             const envData = await envResponse.json();
             window.effectiveToolsFolder = (envData.toolsFolder && envData.toolsFolder.trim() !== '') ? envData.toolsFolder.trim() : 'tools';
             console.log("Effective TOOLS_FOLDER set to:", window.effectiveToolsFolder);
+            if (envData.sshKeyPath) window.gatewaySshKeyPath = envData.sshKeyPath;
+            // Pre-fill the "Server name" box (Users tab) with this gateway's own name.
+            if (envData.clientName) {
+                window.gatewayClientName = envData.clientName;
+                const nameInput = document.getElementById('config-server-name');
+                if (nameInput) nameInput.value = envData.clientName;
+            }
         } else {
             console.warn("Failed to fetch environment info, defaulting effectiveToolsFolder to 'tools'.");
             window.effectiveToolsFolder = 'tools';
@@ -228,6 +241,15 @@ const handleLoginSuccess = async () => {
     if (typeof window.initializeResetAllToolOverridesListener === 'function') { // Call the new initializer
         window.initializeResetAllToolOverridesListener();
     } else { console.error("initializeResetAllToolOverridesListener function not found on window."); }
+    if (typeof window.initializeUsersSection === 'function') {
+        window.initializeUsersSection();
+    } else { console.error("initializeUsersSection function not found on window."); }
+    if (typeof window.initializeMailAccountsSection === 'function') {
+        window.initializeMailAccountsSection();
+    } else { console.error("initializeMailAccountsSection function not found on window."); }
+    if (typeof window.initializeDeployKeySection === 'function') {
+        window.initializeDeployKeySection();
+    } else { console.error("initializeDeployKeySection function not found on window."); }
 };
 
 const handleLogoutSuccess = () => {
@@ -329,7 +351,29 @@ function handleParseConfigExecute() {
     }
 }
 
+// Identify this gateway on the page (incl. the login screen, before auth) so an
+// admin with several IP-only tabs open can tell them apart. Sets the browser tab
+// title, the header text, and an optional accent color.
+async function applyGatewayBranding() {
+    try {
+        const r = await fetch('/admin/info');
+        if (!r.ok) return;
+        const info = await r.json();
+        if (info.name) {
+            document.title = `${info.name} · Patchbay Gateway`;
+            const h1 = document.getElementById('app-title');
+            if (h1) h1.textContent = `Patchbay Gateway · ${info.name}`;
+        }
+        if (info.color) {
+            // Drive the whole theme (header, active tab, buttons, focus rings)
+            // off the gateway's accent color.
+            document.documentElement.style.setProperty('--accent', info.color);
+        }
+    } catch (e) { /* non-fatal: fall back to the generic title */ }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+    applyGatewayBranding();
     if (navServersButton) navServersButton.addEventListener('click', () => showSection('servers-section'));
     if (navToolsButton) {
         navToolsButton.addEventListener('click', () => {
@@ -338,6 +382,41 @@ document.addEventListener('DOMContentLoaded', () => {
             else if (typeof loadToolData !== 'function') console.error("loadToolData not found.");
         });
     }
+    if (navUsersButton) {
+        navUsersButton.addEventListener('click', () => {
+            showSection('users-section');
+            if (typeof window.loadUserList === 'function') window.loadUserList();
+            else console.error("loadUserList not found.");
+        });
+    }
+    if (navMailboxesButton) {
+        navMailboxesButton.addEventListener('click', () => {
+            showSection('mailboxes-section');
+            if (typeof window.loadMailAccountList === 'function') window.loadMailAccountList();
+            else console.error("loadMailAccountList not found.");
+        });
+    }
+    if (navDeployKeyButton) {
+        navDeployKeyButton.addEventListener('click', () => {
+            showSection('deploykey-section');
+            if (typeof window.loadGatewayPublicKey === 'function') window.loadGatewayPublicKey();
+            else console.error("loadGatewayPublicKey not found.");
+        });
+    }
+    if (navHelpButton) navHelpButton.addEventListener('click', () => showSection('help-section'));
+    if (navRequestsButton) {
+        navRequestsButton.addEventListener('click', () => {
+            showSection('requests-section');
+            if (typeof window.loadConnectorRequests === 'function') window.loadConnectorRequests();
+        });
+    }
+    const openCatalogTab = () => {
+        showSection('catalog-section');
+        if (typeof window.loadCatalog === 'function') window.loadCatalog();
+    };
+    if (navCatalogButton) navCatalogButton.addEventListener('click', openCatalogTab);
+    const openCatalogBtn = document.getElementById('open-catalog-button');
+    if (openCatalogBtn) openCatalogBtn.addEventListener('click', openCatalogTab);
     if (navTerminalButton) navTerminalButton.addEventListener('click', () => window.location.href = 'terminal.html');
     if (logoutButton) {
         logoutButton.addEventListener('click', async () => {
@@ -374,7 +453,7 @@ document.addEventListener('DOMContentLoaded', () => {
              const newKey = `new_stdio_server_${Date.now()}`;
              const newServerConf = {
                  type: "stdio", // Specify type
-                 name: "New Stdio Server", active: true, command: "your_command_here", args: [], env: {},
+                 name: "New Stdio Server", active: true, command: "npx", args: ["ssh-mcp", "-y", "--", "--host=CHANGEME", "--port=22", "--user=CHANGEME", `--key=${window.gatewaySshKeyPath || "CHANGEME"}`, "--maxChars=none", "--timeout=600000", "--group=staging", "--disableApproval"], env: {},
                  installDirectory: `${window.effectiveToolsFolder || 'tools'}/${newKey}`
              };
              window.renderServerEntry(newKey, newServerConf, true);

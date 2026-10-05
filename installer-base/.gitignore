@@ -1,0 +1,3 @@
+# Large binaries built by build-base.sh -- reproducible, never committed.
+node/
+mcp-remote/

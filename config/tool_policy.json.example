@@ -1,0 +1,11 @@
+{
+  "default": { "allow": ["*"] },
+  "static": { "allow": ["*"] },
+  "roles": {
+    "readonly": { "allow": ["*/read-command", "*/list-*", "*/sftp-list"] }
+  },
+  "users": {
+    "example-operator": { "allow": ["example-server/*"] },
+    "example-auditor": { "role": "readonly", "deny": ["example-billing/*"] }
+  }
+}

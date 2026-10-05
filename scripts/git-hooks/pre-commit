@@ -1,0 +1,4 @@
+#!/bin/sh
+# Leak guard on staged changes: secrets (gitleaks) and internal identifiers.
+# See docs/guard.md. Enable with: npm run hooks:install
+exec node "$(git rev-parse --show-toplevel)/scripts/guard.mjs" --staged
