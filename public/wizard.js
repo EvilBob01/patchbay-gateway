@@ -61,6 +61,7 @@
                 if (!$('wz-host').value.trim()) { setError('Enter the host / IP.'); return false; }
                 if (!$('wz-user').value.trim()) { setError('Enter the SSH username.'); return false; }
                 if (!$('wz-key').value.trim()) { setError('Enter the SSH key path.'); return false; }
+                if (!$('wz-group').value) { setError('Choose a host group (dev, staging or prod).'); return false; }
             } else if (isNpm()) {
                 if (!$('wz-npm-package').value.trim()) { setError('Enter the npm package name.'); return false; }
             } else {
@@ -79,6 +80,7 @@
             const port = ($('wz-port').value.trim() || '22');
             const user = $('wz-user').value.trim();
             const keyPath = $('wz-key').value.trim();
+            const group = $('wz-group').value;
             return {
                 key,
                 conf: {
@@ -86,7 +88,7 @@
                     name: key,
                     active: true,
                     command: 'npx',
-                    args: ['ssh-mcp', '-y', '--', `--host=${host}`, `--port=${port}`, `--user=${user}`, `--key=${keyPath}`, '--maxChars=none', '--timeout=600000'],
+                    args: ['ssh-mcp', '-y', '--', `--host=${host}`, `--port=${port}`, `--user=${user}`, `--key=${keyPath}`, '--maxChars=none', '--timeout=600000', `--group=${group}`],
                     env: {},
                     installDirectory: '' // ssh-mcp needs no install dir; keep config clean
                 }
@@ -135,6 +137,7 @@
         // reset fields
         ['wz-name', 'wz-host', 'wz-user', 'wz-url', 'wz-bearer', 'wz-password', 'wz-npm-package', 'wz-npm-args', 'wz-npm-env'].forEach(id => { const el = $(id); if (el) el.value = ''; });
         $('wz-port').value = '22';
+        $('wz-group').value = '';
         $('wz-key').value = window.gatewaySshKeyPath || '';
         const sshRadio = document.querySelector('input[name="wz-type"][value="ssh"]');
         if (sshRadio) sshRadio.checked = true;

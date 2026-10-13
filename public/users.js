@@ -25,20 +25,29 @@ function renderUserList(users) {
     users.forEach(user => {
         const entry = document.createElement('div');
         entry.className = 'server-entry';
+        // Fixed markup only; the username (free text) and token go in as text.
         entry.innerHTML = `
             <div class="server-header">
-                <h3>${escapeHtml(user.username)}</h3>
-                <button class="installer-button" data-username="${escapeHtml(user.username)}">Download Installer</button>
-                <button class="config-button" data-token="${escapeHtml(user.token)}">Copy Desktop Config</button>
-                <button class="delete-button" data-username="${escapeHtml(user.username)}">Revoke</button>
+                <h3></h3>
+                <button class="installer-button">Download Installer</button>
+                <button class="config-button">Copy Desktop Config</button>
+                <button class="delete-button">Revoke</button>
             </div>
             <div class="server-details">
                 <label>Token (use in <code>?key=</code> or as a Bearer token):</label>
-                <textarea rows="1" readonly onclick="this.select()">${escapeHtml(user.token)}</textarea>
+                <textarea rows="1" readonly class="user-token"></textarea>
                 <label>Created:</label>
-                <p>${new Date(user.createdAt).toLocaleString()}</p>
+                <p class="user-created"></p>
             </div>
         `;
+        entry.querySelector('h3').textContent = user.username;
+        entry.querySelector('.installer-button').setAttribute('data-username', user.username);
+        entry.querySelector('.config-button').setAttribute('data-token', user.token);
+        entry.querySelector('.delete-button').setAttribute('data-username', user.username);
+        const tokenBox = entry.querySelector('.user-token');
+        tokenBox.value = user.token;
+        tokenBox.addEventListener('click', () => tokenBox.select());
+        entry.querySelector('.user-created').textContent = new Date(user.createdAt).toLocaleString();
         userListEl.appendChild(entry);
     });
 
@@ -87,11 +96,6 @@ function renderUserList(users) {
     });
 }
 
-function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-}
 
 // Build the ready-to-paste Claude Desktop config for a given user token.
 // The gateway base URL is derived from whatever address the admin is currently

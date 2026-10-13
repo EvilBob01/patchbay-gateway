@@ -122,6 +122,11 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             console.log("Requesting new terminal session...");
             const response = await fetch('/admin/terminal/start', { method: 'POST' });
+            if (response.status === 404) {
+                // Not mounted: PATCHBAY_ENABLE_TERMINAL is off on this gateway.
+                updateStatus('Disabled by the administrator (set PATCHBAY_ENABLE_TERMINAL=true to enable).', 'error');
+                return;
+            }
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({ error: 'Failed to parse error response' }));
                 throw new Error(`Failed to start terminal: ${response.status} ${response.statusText} - ${errorData.error}`);

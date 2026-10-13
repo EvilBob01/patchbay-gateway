@@ -3,12 +3,13 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { logger } from './logger.js';
+import { configPath } from './paths.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const STORE_PATH = path.resolve(__dirname, '..', 'config', 'mail_accounts.json');
-const KEY_PATH = path.resolve(__dirname, '..', 'config', '.mail_accounts_key');
+const STORE_PATH = configPath('mail_accounts.json');
+const KEY_PATH = configPath('.mail_accounts_key');
 const PLAINTEXT_ACCOUNTS_PATH = process.env.MAIL_ACCOUNTS_PLAINTEXT_PATH || '/etc/imap-mcp-accounts.json';
 
 export interface MailAccountInput {

@@ -1,0 +1,189 @@
+{
+  "_comment": "Generic sample backends and 'query -> expected tool' pairs for search_tools (test/tool-search.test.mjs). Near-duplicates (search_*, list_*, move_*, delete_*) are deliberate. 'mustRankFirst' pairs a common word (list, get, delete, search) with a specific one; the specific word has to win.",
+  "backends": {
+    "files": {
+      "description": "Files and folders on the shared drive",
+      "tools": {
+        "read_file": "Read the contents of a file.",
+        "write_file": "Write content to a file, replacing what was there.",
+        "list_directory": "List the files and folders in a directory.",
+        "move_file": "Move or rename a file.",
+        "search_files": "Find files whose name matches a pattern."
+      }
+    },
+    "tickets": {
+      "description": "Helpdesk support tickets",
+      "tools": {
+        "create_ticket": "Open a new support ticket.",
+        "get_ticket": "Get one ticket by its ID.",
+        "search_tickets": "Search tickets by text, status or assignee.",
+        "close_ticket": "Close a ticket with a resolution note.",
+        "add_comment": "Add a comment to a ticket."
+      }
+    },
+    "calendar": {
+      "description": "Team calendar",
+      "tools": {
+        "list_events": "List calendar events in a date range.",
+        "create_event": "Create a calendar event (a meeting) and invite attendees.",
+        "delete_event": "Delete a calendar event.",
+        "find_free_time": "Find a time when everyone in a group is free."
+      }
+    },
+    "notes": {
+      "description": "Personal notes",
+      "tools": {
+        "create_note": "Create a note.",
+        "get_note": "Get one note by its ID.",
+        "search_notes": "Search notes by text.",
+        "delete_note": "Delete a note."
+      }
+    },
+    "hv": {
+      "description": "Hypervisor: virtual machines, containers, nodes",
+      "tools": {
+        "list_vms": "List all virtual machines with their status.",
+        "start_vm": "Start a virtual machine.",
+        "stop_vm": "Stop a virtual machine immediately (hard power off).",
+        "shutdown_vm": "Shut down a virtual machine gracefully.",
+        "list_containers": "List all containers with their status.",
+        "get_node_status": "CPU, memory and uptime of a cluster node.",
+        "list_snapshots": "List the snapshots of a virtual machine."
+      }
+    },
+    "mail": {
+      "description": "Email mailboxes",
+      "tools": {
+        "list_emails": "List the emails in a folder.",
+        "read_email": "Read one email message.",
+        "send_email": "Send an email message.",
+        "search_emails": "Search emails by sender, subject or text.",
+        "move_email": "Move an email to another folder."
+      }
+    }
+  },
+  "cases": [
+    [
+      "read a file",
+      "files/read_file"
+    ],
+    [
+      "rename a file",
+      "files/move_file"
+    ],
+    [
+      "what files are in this folder",
+      "files/list_directory"
+    ],
+    [
+      "save text to a file",
+      "files/write_file"
+    ],
+    [
+      "open a support ticket",
+      "tickets/create_ticket"
+    ],
+    [
+      "comment on a ticket",
+      "tickets/add_comment"
+    ],
+    [
+      "close ticket",
+      "tickets/close_ticket"
+    ],
+    [
+      "find tickets assigned to someone",
+      "tickets/search_tickets"
+    ],
+    [
+      "schedule a meeting",
+      "calendar/create_event"
+    ],
+    [
+      "when is everyone free",
+      "calendar/find_free_time"
+    ],
+    [
+      "delete a calendar event",
+      "calendar/delete_event"
+    ],
+    [
+      "search my notes",
+      "notes/search_notes"
+    ],
+    [
+      "list virtual machines",
+      "hv/list_vms"
+    ],
+    [
+      "power off a vm",
+      "hv/stop_vm"
+    ],
+    [
+      "shut down a vm gracefully",
+      "hv/shutdown_vm"
+    ],
+    [
+      "cpu and memory of a node",
+      "hv/get_node_status"
+    ],
+    [
+      "vm snapshots",
+      "hv/list_snapshots"
+    ],
+    [
+      "list containers",
+      "hv/list_containers"
+    ],
+    [
+      "send an email",
+      "mail/send_email"
+    ],
+    [
+      "find emails from a sender",
+      "mail/search_emails"
+    ],
+    [
+      "move email to another folder",
+      "mail/move_email"
+    ]
+  ],
+  "mustRankFirst": [
+    [
+      "list snapshots",
+      "hv/list_snapshots"
+    ],
+    [
+      "list calendar events",
+      "calendar/list_events"
+    ],
+    [
+      "list emails",
+      "mail/list_emails"
+    ],
+    [
+      "list containers",
+      "hv/list_containers"
+    ],
+    [
+      "get ticket",
+      "tickets/get_ticket"
+    ],
+    [
+      "get note",
+      "notes/get_note"
+    ],
+    [
+      "delete note",
+      "notes/delete_note"
+    ],
+    [
+      "search emails",
+      "mail/search_emails"
+    ],
+    [
+      "search tickets",
+      "tickets/search_tickets"
+    ]
+  ]
+}

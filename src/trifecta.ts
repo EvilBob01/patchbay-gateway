@@ -44,7 +44,7 @@ export const TRIFECTA_BLOCKED_CODE = -32010;
 // what an admin named them, so a new ssh-mcp host is classified the moment it is
 // added. the policy's trifecta.backendKinds can pin a backend's kind explicitly.
 
-type BackendKind = 'ssh-mcp' | 'imap-mcp' | 'catalog' | 'context7' | 'unknown';
+export type BackendKind = 'ssh-mcp' | 'imap-mcp' | 'catalog' | 'context7' | 'unknown';
 
 const P = (privateData: boolean, untrustedContent: boolean, externalComm: boolean): Classification =>
   ({ privateData, untrustedContent, externalComm });
@@ -280,6 +280,14 @@ let separator = '__';
 export function configureTrifecta(backends: Record<string, TransportConfig>, sep: string): void {
   backendConfigs = backends;
   separator = sep;
+}
+
+/**
+ * What a backend is, from trifecta.backendKinds or its command line. Also used
+ * by tool collapsing (collapse.ts), so one pin corrects both.
+ */
+export function backendKind(backend: string, cfg: TrifectaConfig = DEFAULT_TRIFECTA): BackendKind {
+  return detectKind(backend, cfg);
 }
 
 function detectKind(backend: string, cfg: TrifectaConfig): BackendKind {

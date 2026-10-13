@@ -126,29 +126,38 @@ function renderToolEntry(toolKey, toolDefinition, toolConfig, isConfigOnly = fal
     const isEnabled = toolConfig.enabled !== false; // Enabled by default
     const originalDescription = toolDefinition?.description || 'N/A'; // Original description for display
 
+    // Fixed markup only; tool names and descriptions come from backends and the
+    // tool config, so they go in as text below, never as HTML.
     entryDiv.innerHTML = `
         <div class="tool-header">
             <label class="inline-label tool-enable-label" title="Enable/Disable Tool">
                 <input type="checkbox" class="tool-enabled-input" ${isEnabled ? 'checked' : ''} ${!isServerActive ? 'disabled' : ''}>
             </label>
-            <h3 title="${!isServerActive ? 'Server is inactive' : ''}">${toolKey}</h3>
-            <span class="tool-exposed-name">Exposed As: ${exposedName}</span>
+            <h3 title="${!isServerActive ? 'Server is inactive' : ''}"></h3>
+            <span class="tool-exposed-name"></span>
             <button class="reset-tool-overrides-button" title="Reset all overrides for this tool to defaults">Reset</button>
         </div>
         <div class="tool-details">
             <div>
                 <label>Exposed Tool Name Override (Optional):</label>
                 <small>Overrides the name exposed to AI models. Must be unique and contain only letters, numbers, _, - (not starting with a number).</small>
-                <input type="text" class="tool-exposedname-input" value="${exposedNameOverride}" placeholder="${toolKey}">
+                <input type="text" class="tool-exposedname-input">
             </div>
             <div>
                 <label>Exposed Description Override (Optional):</label>
-                <textarea class="tool-exposeddescription-input" placeholder="Default: (Original Description below)">${exposedDescriptionOverride}</textarea>
+                <textarea class="tool-exposeddescription-input" placeholder="Default: (Original Description below)"></textarea>
             </div>
-            <p class="tool-original-description">Original Description: ${originalDescription}</p>
+            <p class="tool-original-description"></p>
             ${isConfigOnly ? '<p class="warning-message">This tool was configured but not discovered by any active server.</p>' : ''}
         </div>
     `;
+    entryDiv.querySelector('.tool-header h3').textContent = toolKey;
+    entryDiv.querySelector('.tool-exposed-name').textContent = `Exposed As: ${exposedName}`;
+    const exposedNameInput = entryDiv.querySelector('.tool-exposedname-input');
+    exposedNameInput.value = exposedNameOverride;
+    exposedNameInput.placeholder = toolKey;
+    entryDiv.querySelector('.tool-exposeddescription-input').value = exposedDescriptionOverride;
+    entryDiv.querySelector('.tool-original-description').textContent = `Original Description: ${originalDescription}`;
 
     toolListDiv.appendChild(entryDiv); // Append first, then query elements within it
 

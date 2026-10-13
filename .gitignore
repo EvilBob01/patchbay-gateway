@@ -27,6 +27,9 @@ config/users.json
 # Per-gateway tool access policy (who may use which tools) -- runtime state.
 config/tool_policy.json
 config/tool_policy.json.tmp-*
+# Approved tool definitions (rug-pull protection) -- runtime state.
+config/tool_pins.json
+config/tool_pins.json.tmp-*
 # Mailbox (imap-mcp) accounts store + its encryption key -- live secrets, never commit.
 config/mail_accounts.json
 config/.mail_accounts_key

@@ -1,5 +1,7 @@
 // Append-only tools/call audit trail (plus `event: 'rate-limit'` lines for
-// throttled requests, see recordRateLimit).
+// throttled requests, see recordRateLimit, `event: 'tool-pin'` lines for
+// rug-pull protection, see recordToolPinEvent, and `event: 'backend'` lines for
+// backend crash recovery, see recordBackendEvent).
 //
 // Deliberately NOT part of logger.ts. That is a 65-line console wrapper whose
 // output goes to the journal and is shaped for humans reading a tail; this has
@@ -23,6 +25,8 @@ import { pathDefault } from './paths.js';
 import type { CallerIdentity } from './identity.js';
 import type { AuthzDecision } from './policy.js';
 import type { RateLimitScope } from './ratelimit.js';
+import type { PinEvent } from './toolPins.js';
+import type { BackendTransition } from './backendHealth.js';
 
 const AUDIT_DIR = pathDefault('MCP_AUDIT_DIR', '/var/log/patchbay-gateway/audit', '/var/log/mcp-gateway-audit');
 const ENABLED = process.env.MCP_AUDIT_DISABLE !== 'true';
@@ -59,6 +63,25 @@ export interface ToolCallAuditEntry {
    * through by an allow rule (with its reason), or let through in monitor mode.
    */
   trifecta?: unknown;
+  /**
+   * How the call reached the tool, when not by its own name: `call_read` or
+   * `call_write` for the gateway meta-tools of that name (lazy.ts). `tool`,
+   * `toolKey` and `arguments` then describe the real tool.
+   */
+  via?: string;
+  /**
+   * A gateway meta-call with no backend tool behind it: `activate` (backend
+   * set), `search_tools`, `describe_tool`.
+   */
+  meta?: string;
+  /** tools/call requests actually sent to the backend (1 + retries). */
+  attempts?: number;
+  /**
+   * Why a failed call was not retried, or a retry was not sent: `not-read`
+   * (only tools classed read are retried), `held`, `removed`,
+   * `definition-changed`, `denied`, `backend-down`, `trifecta`.
+   */
+  retryRefused?: string;
 }
 
 function currentFile(): string {
@@ -133,6 +156,10 @@ export function recordToolCall(entry: ToolCallAuditEntry): void {
     ...(entry.errorCode !== undefined ? { errorCode: entry.errorCode } : {}),
     ...(entry.errorMessage ? { errorMessage: entry.errorMessage } : {}),
     ...(entry.trifecta ? { trifecta: entry.trifecta } : {}),
+    ...(entry.via ? { via: entry.via } : {}),
+    ...(entry.meta ? { meta: entry.meta } : {}),
+    ...(entry.attempts !== undefined ? { attempts: entry.attempts } : {}),
+    ...(entry.retryRefused ? { retryRefused: entry.retryRefused } : {}),
     ...(LOG_ARGUMENTS ? { arguments: entry.arguments ?? null } : {}),
   }) + '\n';
 
@@ -211,6 +238,37 @@ export function recordRateLimit(entry: RateLimitAuditEntry, now: number = Date.n
   }
   writeRateLimitLine(entry, state?.suppressed ?? 0);
   rateLimitAudit.set(id, { lastWritten: now, suppressed: 0, last: entry });
+}
+
+/**
+ * Record a tool-pin event (toolPins.ts): a tool held for review, approved,
+ * rejected, removed, or pinned on first sight. Rare by construction (one line
+ * per definition change), so not coalesced. Never throws.
+ */
+export function recordToolPinEvent(e: PinEvent): void {
+  if (!ENABLED) return;
+  appendLine(JSON.stringify({
+    ts: new Date().toISOString(),
+    event: 'tool-pin',
+    action: e.event,
+    backend: e.backend,
+    tool: e.tool,
+    ...(e.oldHash ? { oldHash: e.oldHash } : {}),
+    ...(e.newHash ? { newHash: e.newHash } : {}),
+    ...(e.reason ? { reason: e.reason } : {}),
+    ...(e.admin ? { admin: e.admin } : {}),
+  }) + '\n');
+}
+
+/**
+ * Record a backend state transition (backendHealth.ts): down, connect-failed,
+ * reconnected, failed, or an admin reconnect. Rare by construction (backoff and
+ * flap protection bound them), so not coalesced. Never throws.
+ */
+export function recordBackendEvent(t: BackendTransition): void {
+  if (!ENABLED) return;
+  const { action, backend, ...rest } = t;
+  appendLine(JSON.stringify({ ts: new Date().toISOString(), event: 'backend', action, backend, ...rest }) + '\n');
 }
 
 /**

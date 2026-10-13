@@ -121,9 +121,10 @@ leaves the others running.
 **Admin web UI** (optional, `ENABLE_ADMIN_UI=true`). Manage backend servers (add, edit,
 enable/disable, install, reorder, group), browse a connector catalog, enable/rename
 individual tools, create and revoke users, download a per-user Windows client
-installer, edit the tool policy, manage IMAP mailboxes for a mail connector, push the
-gateway's SSH key to a new host, review end-user connector requests, and open a web
-terminal on the gateway host.
+installer, edit the tool policy, manage IMAP mailboxes for a mail connector, and review
+end-user connector requests. Three riskier features are off until you switch each one
+on: running backend install commands, pushing the gateway's SSH key to a new host, and
+a web terminal on the gateway host.
 
 **Text-block merging** (optional, off by default). Some clients only read the
 *first* content block of a tool result; the OpenAI Responses API's remote MCP tool is
@@ -146,10 +147,15 @@ restarting the gateway.
 
 ![Servers list](docs/images/servers.png)
 
-Each server opens in an editor with fields for its transport: command, one argument per
-line and environment for stdio; URL and API key or bearer token for SSE and HTTP. A
+Each server opens in an editor with fields for its transport: command, arguments (one
+per line, or a JSON array when an argument is empty, padded with spaces or spans lines)
+and environment for stdio; URL and API key or bearer token for SSE and HTTP. A
 guided **Add Server** wizard and a **Catalog** of well-known MCP servers make adding one
-a few clicks.
+a few clicks. **Import from client config** takes the `mcpServers` block you already
+have (Claude Desktop, Claude Code, Cursor, Windsurf, VS Code), shows what the gateway
+can and can't run with recognised credential fields masked (see
+[configuration.md](docs/configuration.md#importing-from-a-client-config)), and imports
+the entries you tick.
 
 ![Editing a server](docs/images/server-edit.png)
 
@@ -207,6 +213,13 @@ trimmed:
 The last line is the tool policy at work: alice may use everything except
 `*/privileged-command`.
 
+### Rug-pull protection
+
+Every backend tool definition is pinned. If a backend changes a tool's
+description or schema, or adds a tool, that tool is withheld until an admin
+approves it on the **Review** tab, with a readable diff. Everything else keeps
+working. See [configuration](docs/configuration.md#rug-pull-protection).
+
 ### Mailboxes
 
 If you run an IMAP/SMTP MCP connector behind the gateway, the **Mailboxes** tab manages
@@ -221,12 +234,13 @@ backend.
 - **Catalog:** browse curated and registry MCP servers and add one in a click. Users
   can *request* a connector from their client through the bundled `catalog-server`,
   and admins approve or reject requests in the **Requests** tab.
-- **Deploy Key:** one-shot, password-authenticated SSH that appends the gateway's
-  public key to a new host's `authorized_keys`. The password is used once and not
-  stored.
-- **Terminal:** a shell on the gateway host in the browser. Secrets (`ADMIN_*`,
-  `ALLOWED_*`, `*_SECRET`, `*_PASSWORD`, `*_TOKEN`, `*_KEY`) are stripped from its
-  environment.
+- **Deploy Key** (opt-in, `PATCHBAY_ENABLE_DEPLOY_KEYS=true`): one-shot,
+  password-authenticated SSH that appends the gateway's public key to a new host's
+  `authorized_keys`. The password is used once and not stored. With the switch off, the
+  tab still shows the public key for you to install by hand.
+- **Terminal** (opt-in, `PATCHBAY_ENABLE_TERMINAL=true`): a shell on the gateway host in
+  the browser. Secrets (`ADMIN_*`, `ALLOWED_*`, `*_SECRET`, `*_PASSWORD`, `*_TOKEN`,
+  `*_KEY`) are stripped from its environment.
 - **Help:** a built-in how-to and glossary.
 - **Per-gateway branding:** `GATEWAY_CLIENT_NAME` and `GATEWAY_UI_COLOR` label the
   tab, header and favicon, so you can tell several gateways apart.
@@ -235,27 +249,42 @@ backend.
 
 ## Quick start
 
-On a Linux host with Node.js 20+ (no containers needed):
+No containers anywhere: the gateway installs natively with Node.js and systemd.
+
+**On a Debian or Ubuntu server**, the installer sets up Node.js, a `patchbay` service
+user, the code at a release tag and a systemd service. It prints what it will do and
+asks first. [Check the script](docs/install.md#checking-the-script-before-you-run-it)
+before you pipe it to a shell:
 
 ```bash
-git clone https://github.com/<you>/patchbay-gateway.git /opt/patchbay-gateway
-cd /opt/patchbay-gateway
-npm install && npm run build
-cp config/mcp_server.json.example config/mcp_server.json   # then edit it
-ENABLE_ADMIN_UI=true ADMIN_PASSWORD='change-me' MCP_AUDIT_DIR=./audit node build/sse.js
+curl -fsSL https://raw.githubusercontent.com/EvilBob01/patchbay-gateway/main/scripts/install.sh | sudo bash
 ```
 
-Open `http://<host>:3663/admin`, create a user in the **Users** tab, and point a client
-at `http://<host>:3663/mcp?key=<token>`.
+It ends by printing the admin URL and the generated admin password and client token,
+once. Re-run it to upgrade; `--uninstall` removes it.
 
-For a real deployment (systemd unit, env file, firewall, upgrades) follow
+**To try it on your own machine** (Node.js 20+):
+
+```bash
+npx patchbay-gateway
+```
+
+This keeps everything in `~/.patchbay-gateway`, listens on `127.0.0.1:3663` only, and
+prints a generated admin login on first run. *(The npm package is not published yet;
+until it is, clone the repository and run `npm install && node build/cli.js`.)*
+
+Then open `/admin`, use **Import from client config** on the Servers tab to bring over
+the servers from your `claude_desktop_config.json`, create a user in the **Users** tab,
+and point a client at `http://<host>:3663/mcp?key=<token>`.
+
+For a manual deployment (unit file, env file, firewall, upgrades) follow
 **[docs/install.md](docs/install.md)**.
 
 ## Documentation
 
 | Document | Contents |
 |---|---|
-| [docs/install.md](docs/install.md) | Native install on Linux with systemd, env file, firewall, upgrades |
+| [docs/install.md](docs/install.md) | One-line installer, `npx` trial, manual native install with systemd, env file, firewall, upgrades |
 | [docs/configuration.md](docs/configuration.md) | Every environment variable, `mcp_server.json`, `users.json`, `tool_policy.json`, rate limits, audit log |
 | [docs/client-setup.md](docs/client-setup.md) | Claude Desktop, Claude Code and other clients via `mcp-remote`; the Windows installer bundle |
 | [TRIFECTA.md](TRIFECTA.md) | The lethal-trifecta model, default classification and the `trifecta` policy section in depth |
@@ -278,14 +307,19 @@ tests.
 
 Read this before you expose a gateway to anyone.
 
-- **The admin UI is root on the gateway host.** It runs install commands and opens a
-  terminal as the service user. Use a strong `ADMIN_PASSWORD`, keep the UI on a private
-  network, and leave `ENABLE_ADMIN_UI` unset where you don't need it. Logins are
-  throttled per IP, the session cookie is `SameSite=Strict` and `HttpOnly`, and session
-  IDs are regenerated on login.
-- **The gateway speaks plain HTTP.** It has no TLS of its own and no bind-address
-  setting: it listens on every interface on `PORT`. Restrict it with a host firewall to
-  a private network or VPN, or put a TLS-terminating reverse proxy in front.
+- **The admin UI can be root on the gateway host.** Its three riskiest features are
+  off unless you switch each one on: the browser terminal (`PATCHBAY_ENABLE_TERMINAL`),
+  running backend install commands (`PATCHBAY_ENABLE_INSTALL_RUNNER`) and pushing the
+  gateway's SSH key to hosts with a password (`PATCHBAY_ENABLE_DEPLOY_KEYS`). A feature
+  that is off has no routes at all. The admin UI has no default password: without a
+  real `ADMIN_PASSWORD` it stays off. Keep the UI on a private network, and leave
+  `ENABLE_ADMIN_UI` unset where you don't need it. Logins are throttled per IP, the
+  session cookie is `SameSite=Strict` and `HttpOnly`, and session IDs are regenerated
+  on login. See [configuration.md](docs/configuration.md#opt-in-admin-features).
+- **The gateway speaks plain HTTP.** It has no TLS of its own and by default listens on
+  every interface on `PORT` (`BIND_HOST` narrows that to one address). Restrict it with
+  a host firewall to a private network or VPN, or put a TLS-terminating reverse proxy
+  in front.
   [docs/install.md](docs/install.md#5-firewall) has the details.
 - **Tokens are bearer secrets.** `config/users.json` holds them in plain text, mode
   `0600` recommended. Anyone holding a token is that user until you revoke it.

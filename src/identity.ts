@@ -43,6 +43,11 @@ export interface CallerIdentity {
    * gateway-wide MCP_MERGE_TEXT_CONTENT default.
    */
   mergeTextContent?: boolean;
+  /**
+   * Per-user override for tool collapsing (collapse.ts), from users.json
+   * `collapseTools`. Absent = follow the gateway-wide MCP_COLLAPSE_TOOLS default.
+   */
+  collapseTools?: boolean;
 }
 
 // Static env tokens (ALLOWED_TOKENS / ALLOWED_KEYS) have no user behind them --
@@ -91,7 +96,7 @@ export async function resolveIdentity(
 
   const users = await loadUsers();
   const user = users.find(u => u.token === token) as
-    (typeof users[number] & { tier?: string; mergeTextContent?: unknown }) | undefined;
+    (typeof users[number] & { tier?: string; mergeTextContent?: unknown; collapseTools?: unknown }) | undefined;
   if (user) {
     return {
       kind: 'user',
@@ -100,6 +105,7 @@ export async function resolveIdentity(
       createdAt: user.createdAt,
       ...(user.tier ? { tier: user.tier } : {}),
       ...(typeof user.mergeTextContent === 'boolean' ? { mergeTextContent: user.mergeTextContent } : {}),
+      ...(typeof user.collapseTools === 'boolean' ? { collapseTools: user.collapseTools } : {}),
     };
   }
 

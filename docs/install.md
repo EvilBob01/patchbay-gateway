@@ -1,8 +1,207 @@
 # Installing Patchbay Gateway
 
-This guide installs the gateway natively on a Linux host (a VM, an LXC container or
-bare metal) as a systemd service. It needs no containers. The commands are for
-Debian/Ubuntu; other distributions need only different package names.
+Patchbay Gateway installs natively: Node.js from your distribution (or NodeSource),
+a systemd service and a dedicated service user. It needs no containers.
+
+- [Quick start: the installer](#quick-start-the-installer)
+- [Checking the script before you run it](#checking-the-script-before-you-run-it)
+- [Installer options, upgrades and uninstalling](#installer-options-upgrades-and-uninstalling)
+- [Trying it locally with npx](#trying-it-locally-with-npx)
+- [Manual install](#manual-install)
+
+## Quick start: the installer
+
+On Debian, Ubuntu or AlmaLinux 9 with systemd (other Fedora/RHEL-family systems on a
+best-effort basis; see [Tested platforms](#tested-platforms)), as a user with `sudo`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/EvilBob01/patchbay-gateway/main/scripts/install.sh | sudo bash
+```
+
+The script prints its plan and asks before it changes anything. It then:
+
+1. installs `git`, `curl`, `build-essential` and `python3`, and Node.js at the version
+   `package.json` asks for (`engines`, currently 20+): from the distribution when its
+   `nodejs` is new enough (Debian 13, Ubuntu 26.04), otherwise from the
+   [NodeSource](https://github.com/nodesource/distributions) apt repository (Node 22),
+   which it adds with its signing key (Debian 12, Ubuntu 24.04). On the RHEL family
+   it uses `dnf`, and when the default `nodejs` is too old (AlmaLinux 9: 16) it
+   enables the `nodejs:22` module stream instead;
+2. creates the system user `patchbay` with home `/var/lib/patchbay`;
+3. clones the GitHub repository at the newest stable release tag (`vX.Y.Z`), runs `npm ci` (which also
+   builds) **as `patchbay`**, and moves the result to `/opt/patchbay-gateway`, owned
+   by root;
+4. on a first install, writes `/etc/patchbay-gateway.env` (mode 600) from
+   [`deploy/patchbay-gateway.env.example`](../deploy/patchbay-gateway.env.example) with a
+   generated admin password, session secret and client token, and an empty
+   `/var/lib/patchbay/config/mcp_server.json`;
+5. installs [`deploy/patchbay-gateway.service`](../deploy/patchbay-gateway.service),
+   starts it, waits until it answers, and prints the admin URL.
+
+The generated admin password and client token are printed **once**, at the end. They
+stay in `/etc/patchbay-gateway.env` (root only) if you need them again.
+
+Runtime state lives outside the code: `/etc/patchbay-gateway.env` and
+`/var/lib/patchbay/config/` (servers, users, policy, layout), via
+`PATCHBAY_CONFIG_DIR`. That is what lets an upgrade replace `/opt/patchbay-gateway`
+wholesale.
+
+Next: firewall the port ([§5](#5-firewall); the installer does not touch your
+firewall), log in, and add backends, for example with **Import from client config**
+on the Servers tab ([configuration.md](configuration.md#importing-from-a-client-config)).
+
+Without a terminal (cloud-init, `pct exec`, CI), the script can't ask, so pass `--yes`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/EvilBob01/patchbay-gateway/main/scripts/install.sh | sudo bash -s -- --yes --port 3663
+```
+
+## Checking the script before you run it
+
+Piping a download into `sudo bash` runs whatever the server sends. The script is plain,
+commented bash with no obfuscation, and it prints every command before running it.
+Read it first:
+
+1. Pick a release from the repository's Releases page and download the script from
+   that **tag** rather than `main`, so you know exactly which version you are reading:
+
+   ```bash
+   TAG=v1.1.0   # the release you picked
+   curl -fsSLO "https://raw.githubusercontent.com/EvilBob01/patchbay-gateway/$TAG/scripts/install.sh"
+   ```
+
+2. Read it: `less install.sh`. The header lists every step; the only things it fetches
+   are distribution packages, the NodeSource key and repository (only when needed), and
+   the git repository.
+3. Optionally compare it with the copy in a clone of the repository at the same tag,
+   or with the release's `scripts/install.sh` on GitHub:
+
+   ```bash
+   git clone --depth 1 --branch "$TAG" https://github.com/EvilBob01/patchbay-gateway.git /tmp/pb
+   diff install.sh /tmp/pb/scripts/install.sh && echo identical
+   ```
+
+4. Run the file you read, pinning the same tag:
+
+   ```bash
+   sudo bash install.sh --version "$TAG"
+   ```
+
+## Installer options, upgrades and uninstalling
+
+| Option | Meaning |
+|---|---|
+| `--version <tag>` | Release tag to install. Default: the newest stable `vX.Y.Z` tag; prereleases such as `v1.1.0-rc1` are never picked by default, pass them here. |
+| `--port <n>` | Port for a first install (default 3663). On upgrade, edit `PORT` in the env file instead. |
+| `--repo <url>` | Repository to clone (default the GitHub repository). |
+| `--prefix <dir>` | Install directory (default `/opt/patchbay-gateway`). |
+| `--yes`, `-y` | Don't ask. Required without a terminal. |
+| `--no-start` | Install and enable, but don't start. |
+| `--uninstall` | Stop and remove the service, the code and `/opt/patchbay-gateway.previous`. Keeps the env file, `/var/lib/patchbay`, the audit log in `/var/log/patchbay-gateway` and the `patchbay` user. |
+| `--purge` | With `--uninstall`, also remove those. |
+| `--from-tarball <file>` | Install from a local source tarball (for testing unreleased code). |
+
+**Upgrading:** run the installer again, optionally with `--version`. It builds the new
+version next to the old one, keeps the old one as `/opt/patchbay-gateway.previous`,
+keeps `/etc/patchbay-gateway.env` and `/var/lib/patchbay`, restarts the service and
+waits for it to answer. Credentials are not printed again.
+
+*Readiness.* The installer waits up to 180 s in all for `GET /healthz` (each probe is
+cut off when that time runs out, so a hung gateway cannot stall it), which answers
+`{"status":"ok"}` with no credentials and exists whether or not the admin UI is
+enabled. It probes `BIND_HOST` from `/etc/patchbay-gateway.env` when that names one
+address, otherwise `127.0.0.1`. It checks that the gateway is listening, not that
+every backend is healthy; the admin UI shows backend state.
+
+*Rollback.* An upgrade keeps the old code as `/opt/patchbay-gateway.previous` and the
+old systemd unit as `/opt/patchbay-gateway.previous.service`. If the new version
+doesn't answer, the installer prints a one-line rollback that restores both, then runs
+`systemctl daemon-reload` and starts the service. The env file and `/var/lib/patchbay`
+are not changed by an upgrade, so they need no restoring. Only one previous version is
+kept: the next upgrade replaces it.
+
+The installer only manages a directory it created (it leaves a `.patchbay-installer`
+marker). It refuses to touch an existing `/opt/patchbay-gateway` from a manual install;
+upgrade that one as in [§7](#7-upgrading).
+
+`--uninstall` never removes Node.js or other packages. If the installer added the
+NodeSource repository, `/etc/apt/sources.list.d/nodesource.list` and
+`/etc/apt/keyrings/nodesource.gpg` stay too; delete them by hand if you no longer want
+Node.js updates from NodeSource.
+
+### Tested platforms
+
+Each row is a fresh unprivileged Proxmox LXC container from the stock template, with
+only `curl` and `ca-certificates` added first. The installer ran piped into `bash`
+from a source tarball (`--from-tarball`), then: the service user, file ownership and
+env file mode; no generated secret in the journal or `/var/log`; admin login; a stdio
+backend added through the admin API and called over `/mcp`; a re-run as an in-place
+upgrade; `--uninstall`, then `--purge`.
+
+| Distribution | Node.js source | Node.js version | Tested |
+|---|---|---|---|
+| Debian 12 (bookworm) | NodeSource (distro has 18) | 22.23.3 | 2026-10-08 |
+| Debian 13 (trixie) | distribution | 20.19.2 | 2026-10-08 |
+| Ubuntu 24.04 LTS (noble) | NodeSource (distro has 18) | 22.23.3 | 2026-10-08 |
+| Ubuntu 26.04 LTS (resolute) | distribution | 22.22.1 | 2026-10-08 |
+| AlmaLinux 9.4 | AppStream module `nodejs:22` (default stream is 16) | 22.23.2 | 2026-10-08 |
+
+**Installer test harness.** `scripts/test-installer.sh <source.tgz>` re-runs the installer
+end to end on any throwaway systemd machine (root; it installs packages and ends with
+`--uninstall --purge`). It covers: a fresh install; an upgrade with `ENABLE_ADMIN_UI=false`;
+an upgrade with `BIND_HOST` set to the machine's address (loopback must not listen); a forced
+failure whose printed rollback restores the old code and systemd unit with the service
+running; the default tag skipping a prerelease; and the purge. Build the tarball from the
+checkout with `git archive --prefix=patchbay-gateway/ -o source.tgz HEAD`.
+
+| Commit | Distribution | Result | Date |
+|---|---|---|---|
+| `fc362a5` | Debian 12 (bookworm) | all scenarios passed | 2026-10-11 |
+| `fc362a5` | Debian 13 (trixie) | all scenarios passed | 2026-10-11 |
+| `fc362a5` | Ubuntu 24.04 LTS (noble) | all scenarios passed | 2026-10-11 |
+| `fc362a5` | AlmaLinux 9.4 | all scenarios passed | 2026-10-11 |
+| `8678af0` | Debian 12 (bookworm) | all scenarios passed, including the slow-start upgrade | 2026-10-12 |
+
+| Distribution | Status | Why |
+|---|---|---|
+| AlmaLinux 9 | **Supported**, with two gaps in the test | Containers can't run SELinux, so enforcing mode was not exercised; the installer relabels what it writes with `restorecon` when SELinux is on. firewalld was not in the image; where it runs, it blocks the port until you open it ([§5](#5-firewall)). |
+| AlmaLinux 10 | **Not tested** | The image needs an x86-64-v3 CPU (AVX2) and the test host doesn't have one. AppStream ships Node 22 as the default, so the installer should take the distribution path. |
+| Devuan 5 | **Not supported** | No systemd. The installer refuses before changing anything and says so. Use the [manual install](#manual-install) with your own init script, or `npx`. |
+| Fedora, other RHEL-likes | Best-effort | Untested. |
+
+## Trying it locally with npx
+
+On any machine with Node.js 20+ (Linux, macOS or Windows):
+
+```bash
+npx patchbay-gateway
+```
+
+On first run this creates `~/.patchbay-gateway/` (config, audit log, `gateway.env` with
+a generated admin password, session secret and client token), prints the credentials
+once, and starts the gateway with the admin UI on `http://127.0.0.1:3663/admin`. It
+binds to `127.0.0.1` so a trial is not reachable from the network.
+
+| Option | Meaning |
+|---|---|
+| `--port <n>` | Port (default 3663, or `PORT`). |
+| `--host <addr>` | Bind address (default `127.0.0.1`, or `BIND_HOST`). `0.0.0.0` accepts remote connections. |
+| `--data-dir <dir>` | Data directory (default `~/.patchbay-gateway`, or `PATCHBAY_HOME`). |
+| `stdio` | Run as a single stdio MCP server instead (for a client to spawn). |
+
+Variables already set in your environment win over `gateway.env`. The admin terminal is
+off unless you set `PATCHBAY_ENABLE_TERMINAL=true` in `gateway.env`; it also
+needs the optional native module `node-pty`. If your machine can't build it, everything
+else still works and the terminal says it is unavailable.
+
+> The `patchbay-gateway` npm package is not published yet. Until it is, clone the
+> repository and run `npm install && node build/cli.js` for the same behaviour.
+
+## Manual install
+
+This installs the gateway by hand on a Linux host (a VM, an LXC container or bare
+metal) as a systemd service. The commands are for Debian/Ubuntu; other distributions
+need only different package names.
 
 1. [Requirements](#1-requirements)
 2. [Get the code and build it](#2-get-the-code-and-build-it)
@@ -13,7 +212,7 @@ Debian/Ubuntu; other distributions need only different package names.
 7. [Upgrading](#7-upgrading)
 8. [Troubleshooting](#8-troubleshooting)
 
-## 1. Requirements
+### 1. Requirements
 
 | | |
 |---|---|
@@ -28,7 +227,7 @@ sudo apt install -y nodejs npm git build-essential python3
 node --version   # must print v20 or newer
 ```
 
-## 2. Get the code and build it
+### 2. Get the code and build it
 
 Create a system user to run the gateway, clone, and build:
 
@@ -56,14 +255,19 @@ sudo chmod 700 /opt/patchbay-gateway/config
 
 See [configuration.md](configuration.md#configmcp_serverjson-backend-servers) for the
 format. You can also start with an empty `{"mcpServers": {}}` and add servers from the
-admin UI.
+admin UI, or import them from a client config.
 
-> **Why a dedicated user?** The admin UI's **Terminal** and **Install** features run as
-> the service user, so whoever logs into the UI gets that user's shell. A dedicated
+To keep this state outside the code directory (as the installer does), set
+`PATCHBAY_CONFIG_DIR` in the env file to a directory the service user owns, for
+example `/var/lib/patchbay/config`, and put `mcp_server.json` there instead.
+
+> **Why a dedicated user?** The admin UI's **Terminal** and **Install** features (both
+> opt-in) run as the service user, so with them on, whoever logs into the UI gets that
+> user's shell. A dedicated
 > account limits that to the gateway's own files and the backend credentials it already
 > holds. If you run as root instead, an admin login is a root shell.
 
-## 3. Environment file
+### 3. Environment file
 
 Create `/etc/patchbay-gateway.env`, readable by root only (systemd reads it before
 dropping privileges):
@@ -123,14 +327,20 @@ TOOLS_FOLDER=/var/lib/patchbay/tools
 Every variable, including rate limits and the text-merge toggle, is described in
 [configuration.md](configuration.md#environment-variables).
 
-> **If you forget `ADMIN_PASSWORD`,** the UI accepts `admin` / `password`. The
-> gateway logs a warning at startup, but it does not refuse to start.
+> **If you forget `ADMIN_PASSWORD`,** or leave it `REPLACE_ME`, the admin UI stays
+> off and the log says `Admin UI NOT enabled`. The MCP endpoints still run. There is
+> no built-in password.
+>
+> **The terminal, install runner and key push are off** until you add
+> `PATCHBAY_ENABLE_TERMINAL=true`, `PATCHBAY_ENABLE_INSTALL_RUNNER=true` or
+> `PATCHBAY_ENABLE_DEPLOY_KEYS=true`. Turn on only the ones you use; see
+> [configuration.md](configuration.md#opt-in-admin-features).
 
-## 4. systemd unit
+### 4. systemd unit
 
 `/etc/systemd/system/patchbay-gateway.service`. This is
-[`deploy/patchbay-gateway.service`](../deploy/patchbay-gateway.service) plus a service
-user, a log directory and light hardening:
+[`deploy/patchbay-gateway.service`](../deploy/patchbay-gateway.service) as shipped: a
+service user, a log directory and light hardening:
 
 ```ini
 [Unit]
@@ -144,7 +354,6 @@ User=patchbay
 Group=patchbay
 EnvironmentFile=/etc/patchbay-gateway.env
 Environment=HOME=/var/lib/patchbay
-# Must be the install directory: mcp_server.json is read from ./config.
 WorkingDirectory=/opt/patchbay-gateway
 ExecStart=/usr/bin/node /opt/patchbay-gateway/build/sse.js
 Restart=on-failure
@@ -171,10 +380,10 @@ settings, one `Connected to server: <name>` line per backend, and the endpoint U
 Using a different install path? `ExecStart` needs `node` and the absolute path to
 `build/sse.js`, and `WorkingDirectory` must be the install directory.
 
-## 5. Firewall
+### 5. Firewall
 
-The gateway serves **plain HTTP on every interface**. It has no bind-address setting
-and no TLS. Treat it like a database port:
+The gateway serves **plain HTTP on every interface** unless `BIND_HOST` names one
+address, and it has no TLS. Treat it like a database port:
 
 - **Put it on a private network**: a management VLAN, WireGuard, or a tailnet. Only
   the machines running MCP clients and the admins' browsers need to reach `PORT`.
@@ -193,6 +402,13 @@ and no TLS. Treat it like a database port:
   Persist the rules in `/etc/nftables.conf`, or use `ufw`:
   `sudo ufw allow from 192.0.2.0/24 to any port 3663 proto tcp`, then
   `sudo ufw deny 3663/tcp`. Cover IPv6 as well, or disable it on that interface.
+  On Fedora/RHEL, firewalld already blocks the port; open it to one network only:
+
+  ```bash
+  sudo firewall-cmd --permanent --new-zone=patchbay
+  sudo firewall-cmd --permanent --zone=patchbay --add-source=192.0.2.0/24 --add-port=3663/tcp
+  sudo firewall-cmd --reload
+  ```
 - **Never expose it to the internet as-is.** If clients must reach it across an
   untrusted network, put a TLS-terminating reverse proxy (nginx, Caddy, HAProxy) in
   front. Consider leaving `/admin` off the public listener and setting `NODE_ENV=production`
@@ -203,7 +419,7 @@ and no TLS. Treat it like a database port:
 - **Optional:** run the gateway without the admin UI (`ENABLE_ADMIN_UI` unset) and
   enable it only when you need it.
 
-## 6. First login
+### 6. First login
 
 1. Browse to `http://<gateway>:3663/admin` and log in with `ADMIN_USERNAME` /
    `ADMIN_PASSWORD`.
@@ -214,7 +430,7 @@ and no TLS. Treat it like a database port:
    `users.<name>` entry per person.
 5. Connect a client: [client-setup.md](client-setup.md).
 
-## 7. Upgrading
+### 7. Upgrading
 
 ```bash
 cd /opt/patchbay-gateway
@@ -234,7 +450,7 @@ users, policy, layout, mailboxes) are ignored by git and survive upgrades. Read
 A restart drops open MCP sessions (clients reconnect) and logs admins out (the session
 store is in memory). Backend-only changes never need a restart: use **Reload**.
 
-## 8. Troubleshooting
+### 8. Troubleshooting
 
 | Symptom | Cause |
 |---|---|

@@ -40,6 +40,58 @@ function renderServerConfig(config) {
      addInstallButtonListeners(); // Ensure listeners are (re-)added after full render
      // Cosmetic: apply saved ordering/groups + search/drag toolbar (does not affect MCP).
      if (window.LayoutEnhancer) window.LayoutEnhancer.apply('servers');
+     // ssh-mcp host-group filter (public/ssh-policy.js).
+     if (window.SshPolicy) window.SshPolicy.afterRender(serverListDiv);
+     loadBackendStatus();
+}
+
+// --- Backend state (GET /admin/server/status): a dot per backend, plus Reconnect ---
+// Deliberately plain; the admin UI redesign will replace it.
+async function loadBackendStatus() {
+    if (!serverListDiv) return;
+    let data;
+    try {
+        const response = await fetch('/admin/server/status');
+        if (!response.ok) return;
+        data = await response.json();
+    } catch { return; }
+    const byName = new Map((data.backends || []).map(b => [b.backend, b]));
+    serverListDiv.querySelectorAll('.server-entry').forEach(entry => {
+        const badge = entry.querySelector('.backend-state');
+        if (!badge) return;
+        const s = byName.get(entry.dataset.serverKey);
+        entry.dataset.backendState = s ? s.state : 'inactive';
+        badge.className = 'backend-state' + (s ? ` backend-state-${s.state}` : '');
+        if (!s) { badge.textContent = ''; badge.title = ''; return; }
+        badge.textContent = s.state === 'up' ? '' : s.state === 'failed' ? 'failed' : `reconnecting (attempt ${Math.max(1, s.attempt)})`;
+        entry.querySelector('.server-header h3').title = badge.title = [
+            `${s.state} since ${new Date(s.since).toLocaleString()}`,
+            `${s.tools} tool(s)`,
+            s.recentCrashes ? `${s.recentCrashes} crash(es) in the last ${data.settings?.flapWindowMin ?? '?'} min` : '',
+            s.nextRetryAt ? `next try ${new Date(s.nextRetryAt).toLocaleTimeString()}` : '',
+            s.lastError ? `last error: ${s.lastError}` : '',
+        ].filter(Boolean).join('\n');
+    });
+}
+window.loadBackendStatus = loadBackendStatus;
+
+async function reconnectBackend(key, button) {
+    const status = document.getElementById('save-status');
+    button.disabled = true;
+    if (status) status.textContent = `Reconnecting ${key}...`;
+    try {
+        const response = await fetch(`/admin/server/reconnect/${encodeURIComponent(key)}`, { method: 'POST' });
+        const body = await response.json().catch(() => ({}));
+        if (status) {
+            status.textContent = body.success ? `${key} reconnected.`
+                : `${key} did not reconnect: ${body.error || body.status?.lastError || response.status}. It will keep retrying.`;
+        }
+    } catch (error) {
+        if (status) status.textContent = `Reconnect failed: ${error.message}`;
+    } finally {
+        button.disabled = false;
+        loadBackendStatus();
+    }
 }
 
 function renderServerEntry(key, serverConf, startExpanded = false) {
@@ -63,20 +115,28 @@ function renderServerEntry(key, serverConf, startExpanded = false) {
     if (type === 'sse') displayType = 'SSE';
     else if (type === 'stdio') displayType = 'Stdio';
     else if (type === 'http') displayType = 'HTTP';
-    else displayType = type.toUpperCase(); // Fallback for unknown but specified types
+    else displayType = String(type).toUpperCase(); // Fallback for unknown but specified types
 
     entryDiv.dataset.serverType = type; // Store the actual type
 
+    // The templates below are fixed markup only. Every config value goes in
+    // afterwards through textContent / .value: an imported display name is
+    // untrusted text, and it must never become HTML.
     const headerDiv = document.createElement('div');
     headerDiv.classList.add('server-header');
     // Move Active checkbox to the header, at the beginning
     headerDiv.innerHTML = `
         <label class="inline-label server-active-label" title="Activate/Deactivate Server">
-            <input type="checkbox" class="server-active-input" ${serverConf.active !== false ? 'checked' : ''}>
+            <input type="checkbox" class="server-active-input">
         </label>
-        <h3>${serverConf.name || key} (<span class="server-type">${displayType}</span>)</h3>
+        <h3><span class="server-display-name"></span> (<span class="server-type"></span>)</h3>
+        <span class="backend-state" title=""></span>
+        <button type="button" class="reconnect-button" title="Close this backend's connection and connect it again">Reconnect</button>
         <button class="delete-button">Delete</button>
     `;
+    headerDiv.querySelector('.server-active-input').checked = serverConf.active !== false;
+    headerDiv.querySelector('.server-display-name').textContent = serverConf.name || key;
+    headerDiv.querySelector('.server-type').textContent = displayType;
     entryDiv.appendChild(headerDiv);
 
     const detailsDiv = document.createElement('div');
@@ -84,42 +144,81 @@ function renderServerEntry(key, serverConf, startExpanded = false) {
 
     // Remove Active checkbox from detailsHtml
     let detailsHtml = `
-        <div><label>Server Key (Unique ID):</label><input type="text" class="server-key-input" value="${key}" required></div>
-        <div><label>Display Name:</label><input type="text" class="server-name-input" value="${serverConf.name || ''}"></div>
+        <div><label>Server Key (Unique ID):</label><input type="text" class="server-key-input" required></div>
+        <div><label>Display Name:</label><input type="text" class="server-name-input"></div>
+        <div><label class="inline-label" title="List only an activate meta-tool for this backend until a session activates it; the gateway search_tools / call_read / call_write reach it meanwhile"><input type="checkbox" class="server-lazy-input"> Lazy: hide its tools until a session activates them</label></div>
+        <div><label>Description (one line, shown in the lazy meta-tools):</label><input type="text" class="server-description-input"></div>
     `;
 
+    let installDirValue = '';
     if (type === 'sse' || type === 'http') {
         detailsHtml += `
-            <div><label>URL:</label><input type="url" class="server-url-input" value="${serverConf.url || ''}" required></div>
-            <div><label>API Key (X-Api-Key Header):</label><input type="text" class="server-apikey-input" value="${serverConf.apiKey || ''}"></div>
-            <div><label>Bearer Token (Authorization Header):</label><input type="text" class="server-bearertoken-input" value="${serverConf.bearerToken || ''}"></div>
+            <div><label>URL:</label><input type="url" class="server-url-input" required></div>
+            <div><label>API Key (X-Api-Key Header):</label><input type="text" class="server-apikey-input secret-input" title="${SECRET_INPUT_HINT}"></div>
+            <div><label>Bearer Token (Authorization Header):</label><input type="text" class="server-bearertoken-input secret-input" title="${SECRET_INPUT_HINT}"></div>
         `;
         // Add any type-specific fields for 'http' if they differ from 'sse' in the future
     } else if (type === 'stdio') {
         const baseInstallPath = (typeof window.effectiveToolsFolder === 'string' && window.effectiveToolsFolder.trim() !== '') ? window.effectiveToolsFolder.trim() : 'tools';
         const defaultInstallDir = `${baseInstallPath}/${key}`;
-        const installDirValue = serverConf.installDirectory !== undefined ? serverConf.installDirectory : defaultInstallDir;
-        
+        installDirValue = String(serverConf.installDirectory !== undefined ? serverConf.installDirectory : defaultInstallDir);
+
         detailsHtml += `
-            <div><label>Command:</label><input type="text" class="server-command-input" value="${serverConf.command || ''}" required></div>
-            <div><label>Arguments (one per line; commas and quotes are preserved):</label><textarea class="server-args-input">${escapeHtml((serverConf.args || []).join('\n'))}</textarea></div>
+            <div><label>Command:</label><input type="text" class="server-command-input" required></div>
+            <div>
+                <label>Arguments:</label> <button type="button" class="server-args-mode-button"></button>
+                <textarea class="server-args-input" spellcheck="false"></textarea>
+                <small class="server-args-note"></small>
+            </div>
             <div>
                 <label>Environment Variables:</label>
                 <div class="env-vars-container"></div>
                 <button type="button" class="add-env-var-button">+ Add Variable</button>
             </div>
             <hr style="margin: 10px 0;">
-            <div><label>Install Directory (optional):</label><input type="text" class="server-install-dir-input" value="${installDirValue}"></div>
-            <div><label>Install Commands (optional, one per line):</label><textarea class="server-install-cmds-input">${(serverConf.installCommands || []).join('\n')}</textarea></div>
-            <button class="install-button" data-server-key="${key}" ${!installDirValue.trim() ? 'disabled title="Install directory must be set to enable install button"' : ''}>Check/Run Install</button>
-            <div class="install-output" id="install-output-${key}" style="display: none; white-space: pre-wrap; background-color: #222; color: #eee; padding: 10px; margin-top: 10px; max-height: 300px; overflow-y: auto; font-family: monospace;"></div>
+            <div><label>Install Directory (optional):</label><input type="text" class="server-install-dir-input"></div>
+            <div><label>Install Commands (optional, one per line):</label><textarea class="server-install-cmds-input"></textarea></div>
+            ${window.featureOn?.('installRunner')
+                ? `<button class="install-button">Check/Run Install</button>`
+                : `<p class="feature-disabled feature-disabled-message">Running install commands: <span class="feature-off-reason"></span></p>`}
+            <div class="install-output" style="display: none; white-space: pre-wrap; background-color: #222; color: #eee; padding: 10px; margin-top: 10px; max-height: 300px; overflow-y: auto; font-family: monospace;"></div>
         `;
     } else {
-         detailsHtml += `<p class="error-message">Warning: Unknown server type configuration ('${type}').</p>`;
+         detailsHtml += `<p class="error-message server-unknown-type"></p>`;
     }
 
     detailsDiv.innerHTML = detailsHtml;
+    const setValue = (selector, value) => {
+        const el = detailsDiv.querySelector(selector);
+        if (el) el.value = value === undefined || value === null ? '' : String(value);
+    };
+    setValue('.server-key-input', key);
+    setValue('.server-name-input', serverConf.name);
+    detailsDiv.querySelector('.server-lazy-input').checked = serverConf.lazy === true;
+    setValue('.server-description-input', serverConf.description);
+    if (type === 'sse' || type === 'http') {
+        setValue('.server-url-input', serverConf.url);
+        setValue('.server-apikey-input', serverConf.apiKey);
+        setValue('.server-bearertoken-input', serverConf.bearerToken);
+    } else if (type === 'stdio') {
+        setValue('.server-command-input', serverConf.command);
+        ServerArgs.setup(detailsDiv, Array.isArray(serverConf.args) ? serverConf.args : []);
+        setValue('.server-install-dir-input', installDirValue);
+        setValue('.server-install-cmds-input', (serverConf.installCommands || []).join('\n'));
+        const button = detailsDiv.querySelector('.install-button');
+        if (button) {
+            button.dataset.serverKey = key;
+            button.disabled = !installDirValue.trim();
+            if (button.disabled) button.title = 'Install directory must be set to enable install button';
+        }
+        const reason = detailsDiv.querySelector('.feature-off-reason');
+        if (reason) reason.textContent = window.featureOffMessage?.('installRunner') || 'Disabled by the administrator.';
+        detailsDiv.querySelector('.install-output').id = `install-output-${key}`;
+    } else {
+        detailsDiv.querySelector('.server-unknown-type').textContent = `Warning: Unknown server type configuration ('${type}').`;
+    }
     entryDiv.appendChild(detailsDiv);
+    detailsDiv.querySelectorAll('.secret-input').forEach(selectMaskedOnFocus);
 
     const envVarsContainer = detailsDiv.querySelector('.env-vars-container');
     if (envVarsContainer && serverConf.env && typeof serverConf.env === 'object') {
@@ -138,6 +237,11 @@ function renderServerEntry(key, serverConf, startExpanded = false) {
 
     headerDiv.querySelector('h3').addEventListener('click', () => entryDiv.classList.toggle('collapsed'));
     headerDiv.querySelector('h3').style.cursor = 'pointer';
+
+    headerDiv.querySelector('.reconnect-button').addEventListener('click', (e) => {
+        e.stopPropagation();
+        reconnectBackend(key, e.currentTarget);
+    });
 
     headerDiv.querySelector('.delete-button').addEventListener('click', (e) => {
         e.stopPropagation();
@@ -197,6 +301,9 @@ function renderServerEntry(key, serverConf, startExpanded = false) {
     });
     // Server key and install dir already have specific listeners that set dirty flag
 
+    // ssh-mcp backends: host-group badges and policy section (public/ssh-policy.js).
+    if (window.SshPolicy) window.SshPolicy.decorate(entryDiv, serverConf);
+
     serverListDiv.appendChild(entryDiv);
 }
 
@@ -215,16 +322,114 @@ function addInstallButtonListeners() {
     });
 }
 
+// Secrets arrive masked from GET /admin/config ("••••••abcd (40 chars)"). Saving
+// a masked value unchanged keeps the stored secret; to change it, replace the
+// whole value -- so focusing a masked field selects it all for overtyping.
+const SECRET_INPUT_HINT = 'Masked: leave as is to keep the stored value, or replace it entirely';
+
+function selectMaskedOnFocus(input) {
+    if (!input) return;
+    input.addEventListener('focus', () => { if (input.value.includes('••••••')) input.select(); });
+}
+
+// --- Arguments editor ---
+// A backend's argv must survive a save exactly: an empty argument, or one with
+// leading or trailing spaces, can mean something to it. So:
+//  - untouched, the editor saves the very array it was rendered from;
+//  - "lines" mode (one per line, trimmed, blank lines skipped) is offered only
+//    for lists it can show without loss;
+//  - anything else is edited as a JSON array of strings, which also carries a
+//    line break inside an argument (written "\n").
+// ssh-policy.js reads and rewrites args through read()/write() as well.
+const ServerArgs = (() => {
+    const JSON_NOTE = 'Shown as a JSON array: an argument is empty, has leading or trailing spaces, or contains a line break, which one-per-line cannot show.';
+    const fitsLines = (args) => args.every(a => typeof a === 'string' && a !== '' && a.trim() === a && !/[\r\n]/.test(a));
+    const format = (args, mode) => mode === 'lines' ? args.join('\n') : JSON.stringify(args, null, 2);
+
+    function parse(ta) {
+        if (ta.dataset.argsMode === 'lines') return ta.value.split(/\r?\n/).map(a => a.trim()).filter(a => a);
+        let args;
+        try { args = JSON.parse(ta.value.trim() || '[]'); } catch (e) { throw new Error(`must be a JSON array of strings (${e.message})`); }
+        if (!Array.isArray(args) || !args.every(a => typeof a === 'string')) throw new Error('must be a JSON array of strings');
+        return args;
+    }
+
+    function show(container, args, mode) {
+        const ta = container.querySelector('.server-args-input');
+        ta.dataset.argsMode = mode;
+        ta.value = format(args, mode);
+        ta.rows = Math.min(12, Math.max(2, ta.value.split('\n').length));
+        const button = container.querySelector('.server-args-mode-button');
+        if (button) button.textContent = mode === 'lines' ? 'Edit as JSON' : 'Edit as lines';
+        const label = button?.previousElementSibling;
+        if (label) label.textContent = mode === 'lines' ? 'Arguments (one per line):' : 'Arguments (JSON array of strings):';
+    }
+
+    function note(container, text) {
+        const el = container.querySelector('.server-args-note');
+        if (el) el.textContent = text;
+    }
+
+    /** Fill the editor in `container` (an entry's details) with `args`. */
+    function setup(container, args) {
+        const ta = container.querySelector('.server-args-input');
+        if (!ta) return;
+        ta._originalArgs = args.slice();
+        ta.dataset.argsEdited = 'false';
+        const mode = fitsLines(args) ? 'lines' : 'json';
+        show(container, args, mode);
+        note(container, mode === 'json' ? JSON_NOTE : '');
+        ta.addEventListener('input', () => { ta.dataset.argsEdited = 'true'; });
+        const button = container.querySelector('.server-args-mode-button');
+        if (button) button.addEventListener('click', () => {
+            let args;
+            try { args = parse(ta); } catch (e) { note(container, `Fix the arguments first: they ${e.message}.`); return; }
+            if (ta.dataset.argsMode === 'json') {
+                if (!fitsLines(args)) { note(container, JSON_NOTE); return; }
+                show(container, args, 'lines');
+                note(container, '');
+            } else {
+                show(container, args, 'json');
+                note(container, '');
+            }
+        });
+    }
+
+    /** The entry's args: the original array if untouched, else parsed. Throws on bad JSON. */
+    function read(entryDiv) {
+        const ta = entryDiv.querySelector('.server-args-input');
+        if (!ta) return [];
+        if (ta.dataset.argsEdited !== 'true' && Array.isArray(ta._originalArgs)) return ta._originalArgs.slice();
+        return parse(ta);
+    }
+
+    /** Replace the entry's args (as an edit: marks it changed). */
+    function write(entryDiv, args) {
+        const ta = entryDiv.querySelector('.server-args-input');
+        if (!ta) return;
+        const mode = ta.dataset.argsMode === 'lines' && fitsLines(args) ? 'lines' : 'json';
+        show(ta.closest('.server-details') || entryDiv, args, mode);
+        if (mode === 'json') note(ta.closest('.server-details') || entryDiv, JSON_NOTE);
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    return { setup, read, write, fitsLines };
+})();
+window.ServerArgs = ServerArgs;
+
 function addEnvVarRow(container, key = '', value = '') {
     if (!container) return;
     const rowDiv = document.createElement('div');
     rowDiv.classList.add('env-var-row');
     rowDiv.innerHTML = `
-        <input type="text" class="env-key-input" placeholder="Key" value="${key}">
+        <input type="text" class="env-key-input" placeholder="Key">
         <span>=</span>
-        <input type="text" class="env-value-input" placeholder="Value" value="${value}">
+        <input type="text" class="env-value-input secret-input" placeholder="Value" title="${SECRET_INPUT_HINT}">
         <button type="button" class="delete-env-var-button">X</button>
     `;
+    rowDiv.querySelector('.env-key-input').value = key;
+    rowDiv.querySelector('.env-value-input').value = value;
+    selectMaskedOnFocus(rowDiv.querySelector('.env-value-input'));
     rowDiv.querySelector('.delete-env-var-button').addEventListener('click', () => {
         rowDiv.remove();
         window.isServerConfigDirty = true; 
@@ -241,7 +446,7 @@ async function handleInstallClick(serverKey) {
         return;
     }
 
-    const installButton = document.querySelector(`.install-button[data-server-key="${serverKey}"]`);
+    const installButton = [...document.querySelectorAll('.install-button')].find(b => b.dataset.serverKey === serverKey);
     const outputElement = typeof window.getInstallOutputElement === 'function' ? window.getInstallOutputElement(serverKey) : document.getElementById(`install-output-${serverKey}`);
 
     if (!outputElement || !installButton) {
@@ -271,7 +476,7 @@ async function handleInstallClick(serverKey) {
     installButton.textContent = 'Installing...';
 
     try {
-        const response = await fetch(`/admin/server/install/${serverKey}`, {
+        const response = await fetch(`/admin/server/install/${encodeURIComponent(serverKey)}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
         });
@@ -310,7 +515,10 @@ function initializeServerSaveListener() {
     localSaveConfigButton.addEventListener('click', async () => {
         localSaveStatus.textContent = 'Saving server configuration...';
         localSaveStatus.style.color = 'orange';
-        const newConfig = { mcpServers: {} };
+        // POST /admin/config replaces the whole file, so carry over the top-level
+        // settings this tab doesn't edit (proxy retries, serverToolnameSeparator,
+        // ...); only mcpServers is rebuilt from the form.
+        const newConfig = { ...(window.currentServerConfig || {}), mcpServers: {} };
         const entries = localServerListDiv.querySelectorAll('.server-entry');
         let isValid = true;
         let errorMsg = '';
@@ -346,6 +554,13 @@ function initializeServerSaveListener() {
                 active: activeInput.checked,
                 type: serverType
             };
+            // Lets the server find a renamed backend's stored secrets; not saved.
+            if (entryDiv.dataset.serverKey && entryDiv.dataset.serverKey !== newKey) serverData._originalKey = entryDiv.dataset.serverKey;
+            const lazyInput = entryDiv.querySelector('.server-lazy-input');
+            const descriptionInput = entryDiv.querySelector('.server-description-input');
+            if (lazyInput && lazyInput.checked) serverData.lazy = true;
+            const description = descriptionInput ? descriptionInput.value.trim() : '';
+            if (description) serverData.description = description;
 
             if (serverType === 'sse' || serverType === 'http') {
                 serverData.url = urlInput.value.trim();
@@ -359,8 +574,13 @@ function initializeServerSaveListener() {
                 serverData.command = commandInput.value.trim();
                 if (!serverData.command) { isValid = false; errorMsg = `Command required for Stdio server "${newKey}".`; commandInput.style.border = '1px solid red'; }
                 else { commandInput.style.border = ''; }
-                const argsString = argsInput.value.trim();
-                serverData.args = argsString ? argsString.split(/\r?\n/).map(arg => arg.trim()).filter(arg => arg) : [];
+                // Exactly as entered, or the original array if untouched (ServerArgs above).
+                try {
+                    serverData.args = ServerArgs.read(entryDiv);
+                    argsInput.style.border = '';
+                } catch (e) {
+                    isValid = false; errorMsg = `Arguments for "${newKey}" ${e.message}.`; argsInput.style.border = '1px solid red'; return;
+                }
                 serverData.env = {};
                 if (envVarsContainer) {
                     envVarsContainer.querySelectorAll('.env-var-row').forEach(row => {
@@ -425,7 +645,9 @@ function initializeServerSaveListener() {
             if (response.ok && result.success) {
                 localSaveStatus.textContent = 'Server configuration saved successfully.';
                 localSaveStatus.style.color = 'green';
-                window.currentServerConfig = newConfig;
+                // The server answers with the saved config re-masked, so freshly
+                // typed secrets don't stay on screen in full.
+                window.currentServerConfig = result.config || newConfig;
                 window.isServerConfigDirty = false; 
                 renderServerConfig(window.currentServerConfig); 
                 if (typeof window.triggerReload === 'function') {

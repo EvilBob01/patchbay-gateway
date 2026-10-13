@@ -1,9 +1,18 @@
 import os from 'os';
-// Ensure 'node-pty' is installed by running 'npm install node-pty' or 'yarn add node-pty'
-import pty, { IPty } from 'node-pty';
 import { Request, Response, Router } from 'express';
 import { ServerResponse } from 'node:http'; // For SSE Response type hint
 import crypto from 'crypto'; // Import crypto for UUID generation
+// node-pty is a native addon and an optional dependency: an install without a
+// C++ toolchain (typically `npx patchbay-gateway`) skips it, and then only the
+// admin terminal is unavailable; the gateway itself runs normally.
+import type { IPty } from 'node-pty';
+let pty: typeof import('node-pty') | null = null;
+try {
+    const mod: any = await import('node-pty');
+    pty = mod.default ?? mod;
+} catch {
+    console.warn('[Terminal] node-pty is not installed; the admin terminal is disabled.');
+}
 
 // Export interface for use in sse.ts shutdown
 export interface ActiveTerminal {
@@ -56,6 +65,7 @@ export function buildTerminalEnv(source: NodeJS.ProcessEnv = process.env): { [ke
 
 function startPtyProcess(): ActiveTerminal {
     const termId = crypto.randomUUID();
+    if (!pty) throw new Error("node-pty is not installed");
     const ptyProcess = pty.spawn(shell, [], {
         name: 'xterm-color',
         cols: 80, // Default size
@@ -176,6 +186,9 @@ setInterval(() => {
 export const terminalRouter = Router();
 
 terminalRouter.post('/start', (req, res) => {
+    if (!pty) {
+        return res.status(503).json({ error: 'The admin terminal needs node-pty, which is not installed on this gateway (it needs a C++ toolchain to build).' });
+    }
     try {
         const terminal = startPtyProcess();
         res.status(200).json({ termId: terminal.id });

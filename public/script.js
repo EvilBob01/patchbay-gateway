@@ -23,6 +23,7 @@ const navDeployKeyButton = document.getElementById('nav-deploykey');
 const navTerminalButton = document.getElementById('nav-terminal');
 const navHelpButton = document.getElementById('nav-help');
 const navRequestsButton = document.getElementById('nav-requests');
+const navReviewButton = document.getElementById('nav-review');
 const navCatalogButton = document.getElementById('nav-catalog');
 const logoutButton = document.getElementById('logout-button');
 const serversSection = document.getElementById('servers-section');
@@ -60,6 +61,11 @@ function connectAdminSSE() {
         window.adminEventSource = null; 
         console.log("Admin SSE connection closed due to error.");
     };
+    adminEventSource.addEventListener('tool_pins_changed', (ev) => {
+        try { window.updateToolPinsBadge?.(JSON.parse(ev.data).pending); } catch { /* ignore */ }
+        if (document.getElementById('review-section')?.style.display !== 'none') window.loadToolPins?.();
+    });
+    adminEventSource.addEventListener('backend_state', () => { window.loadBackendStatus?.(); });
     adminEventSource.addEventListener('connected', function(event) {
         try {
             const data = JSON.parse(event.data);
@@ -158,6 +164,49 @@ window.connectAdminSSE = connectAdminSSE;
 window.appendToInstallOutput = appendToInstallOutput;
 window.getInstallOutputElement = getInstallOutputElement;
 
+// --- Opt-in admin features (terminal, install runner, deploy keys) ---
+// The server does not mount a feature's routes when it is off; this only hides
+// the controls that would hit them. Anything not reported as on counts as off.
+window.adminFeatures = {};
+const featureOn = (name) => window.adminFeatures[name]?.enabled === true;
+const featureOffMessage = (name) => window.adminFeatures[name]?.message || 'Disabled by the administrator.';
+window.featureOn = featureOn;
+window.featureOffMessage = featureOffMessage;
+
+async function loadAdminFeatures() {
+    try {
+        const response = await fetch('/admin/features');
+        window.adminFeatures = response.ok ? await response.json() : {};
+    } catch (err) {
+        console.error("Error fetching admin features:", err);
+        window.adminFeatures = {};
+    }
+    applyAdminFeatures();
+}
+
+function applyAdminFeatures() {
+    if (navTerminalButton) {
+        navTerminalButton.style.display = featureOn('terminal') ? '' : 'none';
+        navTerminalButton.title = featureOn('terminal') ? '' : featureOffMessage('terminal');
+    }
+    const deployOn = featureOn('deployKeys');
+    const deployForm = document.getElementById('deploy-key-form');
+    const deployDisabled = document.getElementById('deploy-key-disabled');
+    if (deployForm) deployForm.style.display = deployOn ? '' : 'none';
+    if (deployDisabled) {
+        deployDisabled.style.display = deployOn ? 'none' : 'block';
+        deployDisabled.querySelector('.feature-disabled-message').textContent = featureOffMessage('deployKeys');
+    }
+    const wizardNo = document.getElementById('wz-trust-no-choice');
+    const wizardNote = document.getElementById('wz-deploy-disabled');
+    if (wizardNo) wizardNo.style.display = deployOn ? '' : 'none';
+    if (wizardNote) {
+        wizardNote.style.display = deployOn ? 'none' : 'block';
+        wizardNote.textContent = `Installing the key from here is off. ${featureOffMessage('deployKeys')} ` +
+            'Add the gateway key to the host yourself (Deploy Key tab shows it), then continue.';
+    }
+}
+
 const showSection = (sectionId) => {
     document.querySelectorAll('.admin-section').forEach(section => {
         section.style.display = 'none';
@@ -220,8 +269,10 @@ const handleLoginSuccess = async () => {
         }
     } catch (err) {
         console.error("Error fetching environment info (TOOLS_FOLDER):", err);
-        window.effectiveToolsFolder = 'tools'; 
+        window.effectiveToolsFolder = 'tools';
     }
+    // Before the server list renders: it decides whether to show Install buttons.
+    await loadAdminFeatures();
 
     showSection('servers-section');
     if (typeof loadServerConfig === 'function') {
@@ -250,6 +301,8 @@ const handleLoginSuccess = async () => {
     if (typeof window.initializeDeployKeySection === 'function') {
         window.initializeDeployKeySection();
     } else { console.error("initializeDeployKeySection function not found on window."); }
+    // Pending tool reviews (tool-pins.js): show the count on the Review tab from the start.
+    window.loadToolPins?.();
 };
 
 const handleLogoutSuccess = () => {
@@ -404,6 +457,13 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
     if (navHelpButton) navHelpButton.addEventListener('click', () => showSection('help-section'));
+    if (navReviewButton) {
+        navReviewButton.addEventListener('click', () => {
+            showSection('review-section');
+            if (typeof window.initializeToolPinsSection === 'function') window.initializeToolPinsSection();
+            if (typeof window.loadToolPins === 'function') window.loadToolPins();
+        });
+    }
     if (navRequestsButton) {
         navRequestsButton.addEventListener('click', () => {
             showSection('requests-section');

@@ -385,6 +385,18 @@ button:disabled, .add-button:disabled { opacity: .55; cursor: not-allowed; }
 
 /* header buttons sit compactly at the right */
 .server-entry .server-header button { margin: 0; flex-shrink: 0; }
+/* backend state (GET /admin/server/status): the dot before the name, plus a word when not up */
+.backend-state { font-size: .8rem; white-space: nowrap; flex-shrink: 0; }
+.backend-state-reconnecting { color: var(--warning); }
+.backend-state-failed { color: var(--danger); font-weight: 600; }
+.server-entry[data-backend-state="reconnecting"] .server-header h3::before { background: var(--warning); box-shadow: 0 0 0 3px var(--warning-soft); }
+.server-entry[data-backend-state="failed"] .server-header h3::before { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
+.server-entry[data-backend-state="inactive"] .server-header h3::before { background: var(--text-muted); box-shadow: none; }
+.server-entry .server-header .reconnect-button {
+    background: var(--surface-2); color: var(--text-muted); border: 1px solid var(--border);
+    padding: .2rem .55rem; font-size: .76rem; font-weight: 550; border-radius: 6px;
+}
+.server-entry .server-header .reconnect-button:hover { color: var(--text); border-color: var(--border-strong); background: var(--surface-3); }
 
 .server-active-label, .tool-enable-label {
     display: inline-flex;
@@ -806,3 +818,73 @@ footer a { color: var(--text-muted); }
 .layout-move-item .chk { width: 1em; color: var(--accent); flex-shrink: 0; }
 .layout-move-item.newgroup { color: var(--accent); font-weight: 560; }
 .layout-move-sep { height: 1px; background: var(--border); margin: .3rem .2rem; }
+
+/* --- Import from client config (public/import.js) --- */
+.import-modal-content { max-width: 820px; }
+#import-text { width: 100%; font-family: var(--mono); font-size: .85rem; }
+.import-file-label { cursor: pointer; color: var(--accent); margin-right: auto; }
+.import-file-label input { font-size: .8rem; }
+#import-entries { display: flex; flex-direction: column; gap: .75rem; max-height: 55vh; overflow-y: auto; overflow-x: hidden; margin: .5rem 0; }
+.import-entry { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: .6rem .8rem; background: var(--surface); }
+.import-entry.import-blocked { opacity: .75; border-style: dashed; }
+.import-entry-head { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+.import-type { font-size: .75rem; padding: .05rem .4rem; border-radius: 999px; background: var(--surface-3); color: var(--text-muted); }
+.import-arrow { color: var(--text-faint); font-size: .85rem; }
+.import-entry-head .import-key { flex: 0 1 16rem; width: auto; min-width: 8rem; margin: 0 0 0 auto; font-family: var(--mono); }
+.import-entry-head input[type="checkbox"] { width: auto; margin: 0; }
+.import-replace-label { display: block; font-size: .85rem; margin-top: .3rem; color: var(--warning); }
+.import-details { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .75rem; margin: .5rem 0 0; font-size: .85rem; }
+.import-details dt { color: var(--text-muted); }
+.import-details dd { margin: 0; overflow-wrap: anywhere; }
+.import-issues { margin: .4rem 0 0; padding-left: 1.2rem; font-size: .85rem; }
+.import-issue-info { color: var(--text-muted); }
+.import-issue-warn { color: var(--warning); }
+.import-issue-error { color: var(--danger); font-weight: 600; }
+
+/* ==========================================================================
+   ssh-mcp policy — host-group badges, editor section, group filter
+   (public/ssh-policy.js)
+   ========================================================================== */
+.ssh-badges { display: inline-flex; flex-wrap: wrap; gap: .3rem; margin-left: .5rem; vertical-align: middle; }
+.ssh-badge {
+    font-size: .68rem; font-weight: 600; padding: .05rem .45rem; border-radius: 999px; white-space: nowrap;
+    color: var(--text-muted); background: var(--surface-3); border: 1px solid var(--border-strong);
+}
+.ssh-badge.g-dev { color: var(--success); background: var(--success-soft); border-color: color-mix(in srgb, var(--success) 35%, transparent); }
+.ssh-badge.g-staging { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+.ssh-badge.g-prod { color: var(--text); }
+.ssh-badge.warn { color: var(--warning); background: var(--warning-soft); border-color: color-mix(in srgb, var(--warning) 35%, transparent); }
+.ssh-badge.danger { color: var(--danger); background: var(--danger-soft); border-color: color-mix(in srgb, var(--danger) 35%, transparent); }
+fieldset.ssh-policy { border: 1px solid var(--border-strong); border-radius: 8px; padding: .5rem .8rem .7rem; margin: .6rem 0; }
+fieldset.ssh-policy legend { font-weight: 640; padding: 0 .3rem; }
+.ssh-policy-note { font-size: .85rem; color: var(--text-muted); margin: .35rem 0; }
+.ssh-policy-note.warn { color: var(--warning); }
+.ssh-policy-note.danger { color: var(--danger); }
+.ssh-policy-help { font-size: .85rem; color: var(--text-muted); margin-top: .4rem; }
+.ssh-policy-help summary { cursor: pointer; }
+.ssh-policy-table { border-collapse: collapse; font-size: .85rem; margin: .3rem 0; }
+.ssh-policy-table th, .ssh-policy-table td { text-align: left; padding: .2rem .8rem .2rem 0; border-bottom: 1px solid var(--border-strong); }
+.ssh-filter-bar { display: flex; align-items: center; gap: .5rem; margin: .4rem 0 .6rem; font-size: .9rem; }
+.ssh-filter-bar label { margin: 0; white-space: nowrap; }
+.ssh-filter-bar select { width: auto; }
+.server-entry.ssh-filter-hidden { display: none !important; }
+
+/* Review tab: rug-pull protection (tool-pins.js) */
+.pin-diff { background: #f6f8fa; padding: 8px; overflow-x: auto; font-size: 12px; white-space: pre-wrap; }
+.pin-add { background: #e6ffec; color: #116329; }
+.pin-del { background: #ffebe9; color: #82071e; }
+.pin-card { border: 1px solid #d0d7de; border-radius: 6px; padding: 10px; margin: 10px 0; }
+.pin-card button { margin-right: 8px; }
+.pin-meta { color: #57606a; font-size: 13px; }
+.pin-error { color: #82071e; font-weight: bold; }
+.pin-backend h3 button { margin-left: 12px; font-size: 13px; }
+
+/* An opt-in admin feature that is switched off on this gateway. */
+.feature-disabled {
+    border-left: 3px solid var(--warning);
+    background: var(--warning-soft);
+    padding: 8px 12px;
+    margin: 10px 0;
+    border-radius: 6px;
+}
+.feature-disabled-message { color: var(--warning); font-weight: 600; margin: 0 0 6px; }

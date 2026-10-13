@@ -3,11 +3,12 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { logger } from './logger.js';
+import { configPath } from './paths.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 export const USERS_PATH = process.env.MCP_USERS_PATH
-  || path.resolve(__dirname, '..', 'config', 'users.json');
+  || configPath('users.json');
 
 export interface UserRecord {
   username: string;

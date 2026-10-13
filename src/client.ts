@@ -6,6 +6,7 @@ import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { TransportConfig, isSSEConfig, isStdioConfig, isHttpConfig } from './config.js';
 import { EventSource } from 'eventsource';
 import { logger } from './logger.js'; // Import logger functions
+import { VERSION } from './version.js';
 
 const sleep = (time: number) => new Promise<void>(resolve => setTimeout(() => resolve(), time))
 export interface ConnectedClient {
@@ -111,7 +112,7 @@ const createClient = (name: string, transportConfig: TransportConfig): { client:
 
    const client = new Client({
      name: 'patchbay-gateway',
-     version: '1.0.0',
+     version: VERSION,
    }, {
      // prompts/resources/tools are server capabilities; a client has none of them to declare.
      capabilities: {}
@@ -120,7 +121,11 @@ const createClient = (name: string, transportConfig: TransportConfig): { client:
    return { client, transport, transportType }
 }
 
-export const createClients = async (mcpServers: Record<string, TransportConfig>): Promise<ConnectedClient[]> => {
+/**
+ * Connect each server (3 tries). Servers that could not be connected are left
+ * out of the result; `failures`, when given, gets each one's last error.
+ */
+export const createClients = async (mcpServers: Record<string, TransportConfig>, failures?: Map<string, string>): Promise<ConnectedClient[]> => {
   const clients: ConnectedClient[] = [];
 
   for (const [name, transportConfig] of Object.entries(mcpServers)) {
@@ -136,6 +141,7 @@ export const createClients = async (mcpServers: Record<string, TransportConfig>)
       const { client, transport, transportType } = createClient(name, transportConfig); // Capture transportType
       if (!client || !transport || !transportType) { // Check transportType
         logger.warn(`Skipping client ${name} due to failed client/transport creation.`); // Changed to warn
+        failures?.set(name, 'could not create the transport');
         break;
       }
 
@@ -153,10 +159,12 @@ export const createClients = async (mcpServers: Record<string, TransportConfig>)
           }
         });
 
+        failures?.delete(name);
         break
 
       } catch (error: any) {
         logger.error(`Failed to connect to ${name}: ${error.message}`); // Log error message
+        failures?.set(name, error?.message || String(error));
         count++;
         retry = (count < retries);
         if (retry) {
@@ -267,7 +275,7 @@ export async function reconnectSingleClient(
 
   const newSdkClient = new Client({
     name: 'patchbay-gateway-reconnect',
-    version: '1.0.1',
+    version: VERSION,
   }, {
     capabilities: {}
   });

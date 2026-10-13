@@ -34,8 +34,14 @@
 //     "users": {
 //       "alice": { "allow": ["forgejo/*"] },
 //       "bob":   { "role": "readonly", "deny": ["billing/*"] }
-//     }
+//     },
+//     "toolClass": { "read": ["hv/get_*", "hv/list_*"], "write": ["hv/get_secret"] }
 //   }
+//
+// "toolClass" sorts tools into read and write for the gateway's call_read /
+// call_write meta-tools (lazy.ts). A tool is read only if a "read" pattern or
+// the backend's own `readOnlyHint: true` says so; "write" patterns beat both.
+// Anything unclassified is write.
 //
 // A pattern is "*" (everything) or "<backend-glob>/<tool-glob>", where "*"
 // matches any run of characters. Backend and tool are the ORIGINAL names from
@@ -46,12 +52,13 @@ import { readFile, stat, writeFile, rename } from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { logger } from './logger.js';
+import { configPath } from './paths.js';
 import type { CallerIdentity } from './identity.js';
 import { compileTrifecta, DEFAULT_TRIFECTA, type TrifectaConfig } from './trifecta.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const TOOL_POLICY_PATH = process.env.MCP_TOOL_POLICY_PATH
-  || path.resolve(__dirname, '..', 'config', 'tool_policy.json');
+  || configPath('tool_policy.json');
 
 /** JSON-RPC error code returned for a tools/call the policy rejects. */
 export const AUTHZ_DENIED_CODE = -32003;
@@ -77,6 +84,15 @@ export interface AuthzRequest {
   backend: string;
   tool: string;
   sessionId?: string;
+}
+
+/** Read/write class of a tool, for call_read / call_write (lazy.ts). */
+export type ToolClass = 'read' | 'write';
+
+export interface ToolClassDecision {
+  toolClass: ToolClass;
+  /** Why: "toolClass.write", "toolClass.read", "readOnlyHint" or "default". */
+  source: string;
 }
 
 export interface AuthzDecision {
@@ -106,6 +122,18 @@ export interface CompiledPolicy {
    * Built-in defaults when the section or the whole file is absent.
    */
   trifecta: TrifectaConfig;
+  /**
+   * Read or write, from the "toolClass" section and the backend's own
+   * annotations. Unknown is write.
+   */
+  classifyTool(backend: string, tool: string, annotations?: { readOnlyHint?: unknown } | null): ToolClassDecision;
+}
+
+/** The backend's own hint only; used when there is no "toolClass" section. */
+function classifyByHint(annotations?: { readOnlyHint?: unknown } | null): ToolClassDecision {
+  return annotations?.readOnlyHint === true
+    ? { toolClass: 'read', source: 'readOnlyHint' }
+    : { toolClass: 'write', source: 'default' };
 }
 
 // --- compilation -----------------------------------------------------------
@@ -169,6 +197,7 @@ export const NO_POLICY: CompiledPolicy = Object.freeze({
   configured: false,
   decide: (): AuthzDecision => ({ allowed: true, rule: 'none', reason: 'no tool policy configured' }),
   trifecta: DEFAULT_TRIFECTA,
+  classifyTool: (_b: string, _t: string, annotations?: { readOnlyHint?: unknown } | null) => classifyByHint(annotations),
 });
 
 /** Unreadable/invalid file: nobody gets anything until it is fixed. */
@@ -176,6 +205,7 @@ const denyAllPolicy = (why: string): CompiledPolicy => ({
   configured: true,
   decide: () => ({ allowed: false, rule: 'invalid-policy', reason: `tool policy is invalid: ${why}` }),
   trifecta: DEFAULT_TRIFECTA,
+  classifyTool: () => ({ toolClass: 'write', source: 'invalid-policy' }),
 });
 
 /**
@@ -204,6 +234,16 @@ export function compilePolicy(raw: unknown): CompiledPolicy {
   const staticRule = file.static !== undefined ? compileRule('static', file.static, roles, false) : undefined;
   const trifecta = compileTrifecta(file.trifecta);
 
+  let classRead: Matcher[] = [];
+  let classWrite: Matcher[] = [];
+  if (file.toolClass !== undefined) {
+    const tc = file.toolClass as Record<string, unknown>;
+    if (typeof tc !== 'object' || tc === null || Array.isArray(tc)) throw new Error('toolClass: must be an object');
+    for (const k of Object.keys(tc)) if (k !== 'read' && k !== 'write') throw new Error(`toolClass: unknown key "${k}"`);
+    classRead = compileList(tc.read, 'toolClass.read');
+    classWrite = compileList(tc.write, 'toolClass.write');
+  }
+
   const ruleFor = (id: CallerIdentity): CompiledRule | null => {
     switch (id.kind) {
       case 'user': return users[id.username] ?? dflt;
@@ -219,6 +259,13 @@ export function compilePolicy(raw: unknown): CompiledPolicy {
   return {
     configured: true,
     trifecta,
+    classifyTool(backend, tool, annotations) {
+      // An explicit write rule beats everything, so a backend cannot promote its
+      // own tools to read; then an explicit read rule; then the backend's hint.
+      if (matchesAny(classWrite, backend, tool)) return { toolClass: 'write', source: 'toolClass.write' };
+      if (matchesAny(classRead, backend, tool)) return { toolClass: 'read', source: 'toolClass.read' };
+      return classifyByHint(annotations);
+    },
     decide({ identity, backend, tool }: AuthzRequest): AuthzDecision {
       const rule = ruleFor(identity);
       if (!rule) return { allowed: false, rule: 'unknown-identity', reason: 'caller identity could not be resolved' };

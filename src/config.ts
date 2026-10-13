@@ -1,6 +1,6 @@
 import { readFile } from 'fs/promises';
-import { resolve } from 'path';
 import { logger } from './logger.js';
+import { workingConfigPath } from './paths.js';
 
 export type TransportConfigStdio = {
   type: 'stdio';
@@ -33,7 +33,13 @@ export type TransportConfigHTTP = {
   // requestInit?: RequestInit; // This is a more generic way if SDK supports it directly in config
 }
 
-export type TransportConfig = (TransportConfigStdio | TransportConfigSSE | TransportConfigHTTP) & { name?: string, active?: boolean, type: 'stdio' | 'sse' | 'http' };
+export type TransportConfig = (TransportConfigStdio | TransportConfigSSE | TransportConfigHTTP) & {
+  name?: string, active?: boolean, type: 'stdio' | 'sse' | 'http',
+  /** Publish this backend behind its activate meta-tool and the gateway meta-tools (lazy.ts). */
+  lazy?: boolean,
+  /** One-line summary shown in the lazy meta-tools' descriptions. */
+  description?: string,
+};
 
 export interface ProxySettings {
   retrySseToolCall?: boolean; // Renamed from retrySseToolCallOnDisconnect
@@ -116,7 +122,7 @@ export const loadConfig = async (): Promise<Config> => {
 
 
   try {
-    const configPath = resolve(process.cwd(), 'config', 'mcp_server.json');
+    const configPath = workingConfigPath('mcp_server.json');
     console.log(`Attempting to load configuration from: ${configPath}`);
     const fileContents = await readFile(configPath, 'utf-8');
     const parsedConfig = JSON.parse(fileContents) as Config;
@@ -347,7 +353,7 @@ export const loadConfig = async (): Promise<Config> => {
 export const loadToolConfig = async (): Promise<ToolConfig> => {
  const defaultConfig: ToolConfig = { tools: {} };
 try {
- const configPath = resolve(process.cwd(), 'config', 'tool_config.json');
+ const configPath = workingConfigPath('tool_config.json');
  logger.log(`Attempting to load tool configuration from: ${configPath}`);
  const fileContents = await readFile(configPath, 'utf-8');
  const parsedConfig = JSON.parse(fileContents) as ToolConfig;

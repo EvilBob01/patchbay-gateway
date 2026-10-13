@@ -9,11 +9,15 @@ import crypto from 'crypto';
 import { exec as execCallback, spawn } from 'child_process'; // Import spawn
 import { promisify } from 'util';
 // Import the necessary functions from mcp-proxy and config
-import { createServer, updateBackendConnections, getCurrentProxyState, refreshBackendConnection, setSessionIdentity, clearSessionIdentity, getSessionIdentity } from "./mcp-proxy.js";
+import { createServer, updateBackendConnections, getCurrentProxyState, refreshBackendConnection, setSessionIdentity, clearSessionIdentity, getSessionIdentity,
+    getToolPinState, approveToolPin, rejectToolPin, approveBackendToolPins, recheckToolPins, onToolPinsChanged,
+    getBackendStatus, reconnectBackendNow, onBackendStateChanged } from "./mcp-proxy.js";
+import { PinError, pinsConfigSummary } from './toolPins.js';
 import { resolveIdentity, ANONYMOUS_IDENTITY, UNKNOWN_IDENTITY, type CallerIdentity } from './identity.js';
 import { compilePolicy, readPolicyFile, writePolicyFile, TOOL_POLICY_PATH } from './policy.js';
 import { auditConfigSummary, recordRateLimit, flushRateLimitAudit, auditDrained } from './audit.js';
 import { mergeTextContentConfigSummary } from './tool-result.js';
+import { collapseToolsConfigSummary } from './collapse.js';
 import { RATE_LIMIT_ENABLED, RATE_LIMITED_CODE, HTTP_LIMIT, httpLimiter, toolCallLimiter, rateKey, rateLimitErrorData, rateLimitMessage, rateLimitConfigSummary } from './ratelimit.js';
 import { clearSessionTrifecta } from './trifecta.js';
 import http from 'http';
@@ -23,13 +27,17 @@ import { Tool, ListToolsResultSchema, JSONRPCMessage, JSONRPCError } from "@mode
 // Import loadToolConfig as well
 import { Config, loadConfig, isStdioConfig, loadToolConfig } from './config.js';
 import { logger } from './logger.js';
-import { pathDefault } from './paths.js';
-// Import terminal router and related types/variables for shutdown
-import { terminalRouter, activeTerminals, TERMINAL_OUTPUT_SSE_CONNECTIONS, ActiveTerminal } from './terminal.js';
+import { pathDefault, configPath } from './paths.js';
+// The terminal module (a root PTY in the browser) is imported further down,
+// and only when PATCHBAY_ENABLE_TERMINAL is on.
+import { envFlag, readAdminFeatures, describeAdminFeatures, adminPasswordProblem, disabledMessage, FEATURE_ENV } from './adminFeatures.js';
 import { loadUsers, saveUsers, generateToken, UserRecord } from './users.js';
 import { listMailAccountsSafe, upsertMailAccount, deleteMailAccount, testMailAccountConnection, validateAccountName } from './mailAccounts.js';
 import { deployKeyToHost, getGatewayPublicKey, PRIVATE_KEY_PATH } from './deployKey.js';
+import { maskConfigSecrets, mergeConfigSecrets, MaskedSecretError } from './configSecrets.js';
+import { describeTomlPolicies } from './sshPolicy.js';
 import archiver from 'archiver';
+import { parseClientConfig, defaultImportContext, maskCandidate, storePreview, takePreview, dropPreview, applySelections } from './importConfig.js';
 
 // Directory holding the prebuilt Windows client installer payload (portable node,
 // pre-installed mcp-remote, install scripts). Built by installer-base/build-base.sh.
@@ -104,17 +112,24 @@ declare module 'express-session' {
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Readiness probe for installers and supervisors. Always mounted (it does not
+// depend on the optional admin UI), needs no credentials, and says nothing but
+// "the process is up and routing". Backend health is reported elsewhere.
+app.get('/healthz', (_req, res) => {
+  res.set('Cache-Control', 'no-store').json({ status: 'ok' });
+});
 const expressServer = http.createServer(app);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const CONFIG_PATH = path.resolve(__dirname, '..', 'config', 'mcp_server.json');
-const TOOL_CONFIG_PATH = path.resolve(__dirname, '..', 'config', 'tool_config.json');
-const SECRET_FILE_PATH = path.resolve(__dirname, '..', 'config', '.session_secret');
-const CATALOG_PATH = path.resolve(__dirname, '..', 'config', 'catalog.json');
-const REQUESTS_PATH = path.resolve(__dirname, '..', 'config', 'requests.json');
+const CONFIG_PATH = configPath('mcp_server.json');
+const TOOL_CONFIG_PATH = configPath('tool_config.json');
+const SECRET_FILE_PATH = configPath('.session_secret');
+const CATALOG_PATH = configPath('catalog.json');
+const REQUESTS_PATH = configPath('requests.json');
 // Cosmetic admin-UI layout (server/tool ordering + collapsible groups). Display-only,
 // does not affect MCP operation. Per-gateway.
-const UI_LAYOUT_PATH = path.resolve(__dirname, '..', 'config', 'ui_layout.json');
+const UI_LAYOUT_PATH = configPath('ui_layout.json');
 // npm registry search that powers the "external" (browse-only) catalog. Everything
 // it returns is npx-runnable. Query is overridable; results are cached.
 const EXTERNAL_REGISTRY_QUERY = process.env.EXTERNAL_REGISTRY_QUERY || 'mcp server';
@@ -123,7 +138,7 @@ let externalCache: { fetchedAt: number; items: any[] } | null = null;
 const EXTERNAL_TTL_MS = 60 * 60 * 1000; // 1h
 const REGISTRY_URL = process.env.MCP_REGISTRY_URL || 'https://registry.modelcontextprotocol.io/v0/servers';
 const REGISTRY_MAX_PAGES = parseInt(process.env.MCP_REGISTRY_MAX_PAGES || '6', 10); // ~600 entries
-const ICON_CACHE_DIR = path.resolve(__dirname, '..', 'config', 'icon-cache');
+const ICON_CACHE_DIR = configPath('icon-cache');
 const ICON_TTL_MS = 7 * 24 * 60 * 60 * 1000; // refresh weekly
 const publicPath = path.join(__dirname, '..', 'public');
 
@@ -391,6 +406,8 @@ logger.log(`MCP Endpoint Authentication: ${authEnabled ? `Enabled. ${allowedKeys
 logger.log(auditConfigSummary());
 logger.log(rateLimitConfigSummary());
 logger.log(mergeTextContentConfigSummary());
+logger.log(collapseToolsConfigSummary());
+logger.log(pinsConfigSummary());
 
 /**
  * Resolve the caller behind an already-authenticated request.
@@ -446,19 +463,21 @@ setInterval(() => {
 }, 5_000).unref();
 
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'password';
+// No built-in fallback: without a real password the admin UI stays off.
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? '';
 const SESSION_SECRET_ENV = process.env.SESSION_SECRET; // Read from env
-
-if (ADMIN_PASSWORD === 'password') {
-    logger.warn("WARNING: Using default admin password. Set ADMIN_PASSWORD environment variable for security.");
-}
 // SESSION_SECRET warning is handled in getSessionSecret
 
-// Read the ENABLE_ADMIN_UI environment variable.
-const rawEnableAdminUI = process.env.ENABLE_ADMIN_UI;
-// Enable Admin UI if ENABLE_ADMIN_UI is 'true' (case-insensitive), '1', or 'yes' (case-insensitive).
-// Defaults to false if not set, empty, or any other value.
-const enableAdminUI = typeof rawEnableAdminUI === 'string' && (rawEnableAdminUI.toLowerCase() === 'true' || rawEnableAdminUI === '1' || rawEnableAdminUI.toLowerCase() === 'yes');
+// Enable Admin UI if ENABLE_ADMIN_UI is 'true', '1' or 'yes' (case-insensitive)
+// AND ADMIN_PASSWORD is a real password. The MCP endpoints run either way.
+const adminUIRequested = envFlag(process.env.ENABLE_ADMIN_UI);
+const adminPasswordIssue = adminPasswordProblem(process.env.ADMIN_PASSWORD);
+const enableAdminUI = adminUIRequested && adminPasswordIssue === null;
+if (adminUIRequested && adminPasswordIssue) {
+    logger.error(`ERROR: Admin UI NOT enabled: ${adminPasswordIssue}. Set a real ADMIN_PASSWORD in the env file and restart. The MCP endpoints are running.`);
+}
+// The risky admin features, each opt-in on top of the admin UI.
+const adminFeatures = readAdminFeatures();
 
 async function getSessionSecret(): Promise<string> {
     if (SESSION_SECRET_ENV && SESSION_SECRET_ENV !== 'unsafe-default-secret' && SESSION_SECRET_ENV.trim() !== '') {
@@ -503,13 +522,12 @@ async function getSessionSecret(): Promise<string> {
 // Defined globally so it can be accessed by routes defined within the 'if (enableAdminUI)' block
 const adminSseConnections = new Map<string, ServerResponse>();
 
+// Loaded only when PATCHBAY_ENABLE_TERMINAL is on; the shutdown handler kills its PTYs.
+let terminalModule: typeof import('./terminal.js') | null = null;
+
 if (enableAdminUI) {
     logger.log("Admin UI is ENABLED.");
-    // Use global ADMIN_USERNAME and ADMIN_PASSWORD defined earlier.
-
-    if (ADMIN_PASSWORD === 'password') { // Use global ADMIN_PASSWORD
-        logger.warn("WARNING: Using default admin password. Set ADMIN_USERNAME and ADMIN_PASSWORD environment variables for security.");
-    }
+    logger.log(`Admin features: ${describeAdminFeatures(adminFeatures)}`);
 
     const sessionSecret = await getSessionSecret();
 
@@ -576,6 +594,16 @@ if (enableAdminUI) {
     // which are non-secret (the name already appears in every client's config URL).
     app.get('/admin/info', (req, res) => {
         res.json({ name: GATEWAY_CLIENT_NAME, color: GATEWAY_UI_COLOR });
+    });
+
+    // Which opt-in admin features are on, so the UI can hide the rest. A feature
+    // that is off has no routes at all; hiding its button is only cosmetic.
+    app.get('/admin/features', isAuthenticated, (req, res) => {
+        const out: Record<string, { enabled: boolean; env: string; message?: string }> = {};
+        for (const k of Object.keys(FEATURE_ENV) as (keyof typeof FEATURE_ENV)[]) {
+            out[k] = { enabled: adminFeatures[k], env: FEATURE_ENV[k], ...(adminFeatures[k] ? {} : { message: disabledMessage(k) }) };
+        }
+        res.json(out);
     });
 
     // Per-gateway favicon (public): a rounded tile in the gateway's accent color
@@ -785,9 +813,10 @@ if (enableAdminUI) {
     app.get('/admin/config', isAuthenticated, async (req, res) => {
         try {
             logger.log("Admin request: GET /admin/config");
-            const configData = await readFile(CONFIG_PATH, 'utf-8');
-            res.setHeader('Content-Type', 'application/json');
-            res.send(configData);
+            // Backend secrets go out masked (configSecrets.ts); POST puts them back.
+            const configData = JSON.parse(await readFile(CONFIG_PATH, 'utf-8'));
+            res.setHeader('Cache-Control', 'no-store');
+            res.json(maskConfigSecrets(configData));
         } catch (error: any) {
             logger.error(`Error reading config file at ${CONFIG_PATH}:`, error);
             if (error.code === 'ENOENT') {
@@ -807,16 +836,43 @@ if (enableAdminUI) {
                 return res.status(400).json({ error: 'Invalid configuration format: Expected a JSON object.' });
             }
 
-            const configString = JSON.stringify(newConfigData, null, 2);
+            // Masked values from GET mean "keep what's stored": swap them back in.
+            let storedConfig: any = {};
+            try {
+                storedConfig = JSON.parse(await readFile(CONFIG_PATH, 'utf-8'));
+            } catch (error: any) {
+                if (error.code !== 'ENOENT') throw error;
+            }
+            let mergedConfig: any;
+            try {
+                mergedConfig = mergeConfigSecrets(newConfigData, storedConfig);
+            } catch (error) {
+                if (error instanceof MaskedSecretError) return res.status(400).json({ error: error.message });
+                throw error;
+            }
+
+            const configString = JSON.stringify(mergedConfig, null, 2);
             await writeFile(CONFIG_PATH, configString, 'utf-8');
             logger.log(`Configuration file updated successfully by admin '${req.session.user?.username}'.`);
-            res.json({ success: true });
+            res.json({ success: true, config: maskConfigSecrets(mergedConfig) });
         } catch (error) {
             logger.error(`Error writing config file at ${CONFIG_PATH}:`, error);
             res.status(500).json({ error: 'Failed to write configuration file.' });
         }
     });
 
+
+    // ssh-mcp host groups of TOML-configured backends (read-only). Returns only
+    // each profile's name and group, never other file content; see sshPolicy.ts.
+    app.get('/admin/ssh-policy', isAuthenticated, async (req, res) => {
+        try {
+            const config = JSON.parse(await readFile(CONFIG_PATH, 'utf-8'));
+            res.json({ toml: await describeTomlPolicies(config?.mcpServers || {}) });
+        } catch (error: any) {
+            logger.error('Admin ssh-policy: failed to read config:', error?.message || error);
+            res.status(500).json({ error: 'Failed to read server configuration.' });
+        }
+    });
 
     // Updated to use getCurrentProxyState
     app.get('/admin/tools/list', isAuthenticated, async (req, res) => {
@@ -918,6 +974,82 @@ if (enableAdminUI) {
         } catch (error: any) {
             logger.error("Error during configuration reload:", error);
             res.status(500).json({ success: false, error: 'Failed to reload server configuration.', details: error.message });
+        }
+    });
+
+    // --- Backend health (backendHealth.ts): per-backend up / reconnecting / failed ---
+    // Admin-only: lastError can name paths and hosts, so it never goes to MCP clients.
+    app.get('/admin/server/status', isAuthenticated, (req, res) => {
+        res.json(getBackendStatus());
+    });
+
+    // Reconnect one backend now, whatever its state; clears its flap history.
+    app.post('/admin/server/reconnect/:serverKey', isAuthenticated, async (req, res) => {
+        const { serverKey } = req.params;
+        const admin = req.session.user?.username || 'admin';
+        logger.log(`Admin request: POST /admin/server/reconnect/${serverKey} by user '${admin}'`);
+        try {
+            const status = await reconnectBackendNow(serverKey, admin);
+            res.status(status.state === 'up' ? 200 : 502).json({ success: status.state === 'up', status });
+        } catch (error: any) {
+            res.status(error?.status === 404 ? 404 : 500).json({ success: false, error: error?.message || String(error) });
+        }
+    });
+
+    // --- Import backends from a client config (claude_desktop_config.json etc.) ---
+    // Two steps so secrets never travel back to the browser: preview parses the
+    // pasted file and returns entries with every secret masked, keeping the full
+    // entries server-side under an id bound to this admin session; import takes
+    // that id plus the admin's choices, writes mcp_server.json and reloads.
+    // JSON bodies only: a cross-site form post cannot send application/json, on
+    // top of the sameSite=strict session cookie every admin route relies on.
+    const readServerConfigForImport = async (): Promise<any> => {
+        try {
+            const parsed = JSON.parse(await readFile(CONFIG_PATH, 'utf-8'));
+            if (typeof parsed !== 'object' || parsed === null) throw new Error('mcp_server.json is not a JSON object');
+            if (typeof parsed.mcpServers !== 'object' || parsed.mcpServers === null) parsed.mcpServers = {};
+            return parsed;
+        } catch (error: any) {
+            if (error.code === 'ENOENT') return { mcpServers: {} };
+            throw error;
+        }
+    };
+
+    app.post('/admin/import/preview', isAuthenticated, async (req, res) => {
+        if (!req.is('application/json')) return res.status(415).json({ error: 'Expected application/json.' });
+        try {
+            const current = await readServerConfigForImport();
+            const { format, candidates } = parseClientConfig(req.body?.text, defaultImportContext(Object.keys(current.mcpServers)));
+            if (candidates.length === 0) return res.status(400).json({ error: 'The config lists no servers.' });
+            const previewId = storePreview(req.sessionID, candidates);
+            logger.log(`Admin '${req.session.user?.username}' previewed an import of ${candidates.length} backend(s) (${format}).`);
+            res.json({ previewId, format, entries: candidates.map(maskCandidate) });
+        } catch (error: any) {
+            res.status(400).json({ error: error.message || 'Could not parse the config.' });
+        }
+    });
+
+    app.post('/admin/import/apply', isAuthenticated, async (req, res) => {
+        if (!req.is('application/json')) return res.status(415).json({ error: 'Expected application/json.' });
+        const { previewId, selections } = req.body || {};
+        const candidates = takePreview(previewId, req.sessionID);
+        if (!candidates) return res.status(410).json({ error: 'This preview has expired or belongs to another session; paste the config again.' });
+        let imported: string[];
+        try {
+            const current = await readServerConfigForImport();
+            imported = applySelections(current.mcpServers, candidates, selections);
+            await writeFile(CONFIG_PATH, JSON.stringify(current, null, 2), 'utf-8');
+            dropPreview(previewId);
+            logger.log(`Admin '${req.session.user?.username}' imported backend(s): ${imported.join(', ')}`);
+        } catch (error: any) {
+            return res.status(400).json({ error: error.message || 'Import failed.' });
+        }
+        try {
+            await updateBackendConnections(await loadConfig(), await loadToolConfig());
+            res.json({ success: true, imported, reloaded: true });
+        } catch (error: any) {
+            logger.error('Reload after import failed:', error);
+            res.json({ success: true, imported, reloaded: false, error: `Saved, but the reload failed: ${error.message}` });
         }
     });
 
@@ -1034,6 +1166,61 @@ if (enableAdminUI) {
     // + install scripts) plus a generated params.json carrying this user's token and
     // the gateway URL (derived from the Host header, i.e. however the admin reached
     // this UI). The end user double-clicks Install.bat; nothing else is needed.
+    // --- Rug-pull protection: tool pins review (toolPins.ts) ---
+    // Approve/reject carry the hash the admin reviewed; a definition that changed
+    // again since the page loaded is refused (409), never approved unseen.
+    const pinBody = (req: Request) => {
+        const { backend, tool, hash } = req.body ?? {};
+        return [backend, tool, hash].every(v => typeof v === 'string' && v) ? { backend, tool, hash } : undefined;
+    };
+    const pinFailure = (res: Response, error: any) => {
+        const status = error instanceof PinError ? error.status : (error?.status === 400 ? 400 : 500);
+        if (status === 500) logger.error('Tool pins:', error?.message || error);
+        res.status(status).json({ error: error?.message || String(error) });
+    };
+
+    app.get('/admin/tool-pins', isAuthenticated, (req, res) => {
+        res.json(getToolPinState());
+    });
+
+    app.post('/admin/tool-pins/approve', isAuthenticated, async (req, res) => {
+        const b = pinBody(req);
+        if (!b) return res.status(400).json({ error: 'backend, tool and hash are required.' });
+        try {
+            await approveToolPin(b.backend, b.tool, b.hash, req.session.user?.username || 'admin');
+            res.json({ success: true });
+        } catch (error: any) { pinFailure(res, error); }
+    });
+
+    app.post('/admin/tool-pins/reject', isAuthenticated, async (req, res) => {
+        const b = pinBody(req);
+        if (!b) return res.status(400).json({ error: 'backend, tool and hash are required.' });
+        try {
+            await rejectToolPin(b.backend, b.tool, b.hash, req.session.user?.username || 'admin');
+            res.json({ success: true });
+        } catch (error: any) { pinFailure(res, error); }
+    });
+
+    app.post('/admin/tool-pins/approve-backend', isAuthenticated, async (req, res) => {
+        const { backend, hashes } = req.body ?? {};
+        if (typeof backend !== 'string' || !backend || !hashes || typeof hashes !== 'object'
+            || !Object.values(hashes).every(h => typeof h === 'string')) {
+            return res.status(400).json({ error: 'backend and hashes ({tool: hash}) are required.' });
+        }
+        try {
+            await approveBackendToolPins(backend, hashes, req.session.user?.username || 'admin');
+            res.json({ success: true });
+        } catch (error: any) { pinFailure(res, error); }
+    });
+
+    app.post('/admin/tool-pins/recheck', isAuthenticated, async (req, res) => {
+        const backend = typeof req.body?.backend === 'string' && req.body.backend ? req.body.backend : undefined;
+        try {
+            await recheckToolPins(backend);
+            res.json({ success: true, state: getToolPinState() });
+        } catch (error: any) { pinFailure(res, error); }
+    });
+
     app.get('/admin/users/:username/installer', isAuthenticated, async (req, res) => {
         const { username } = req.params;
         try {
@@ -1161,7 +1348,9 @@ if (enableAdminUI) {
         }
     });
 
-    app.post('/admin/deploy-key', isAuthenticated, async (req, res) => {
+    // Pushing the key logs in to another host with a password: opt-in. Reading
+    // the public key above stays available for a manual ssh-copy-id.
+    if (adminFeatures.deployKeys) app.post('/admin/deploy-key', isAuthenticated, async (req, res) => {
         const { host, port, username, password } = req.body;
         if (!host || !username || !password) {
             return res.status(400).json({ error: 'host, username, and password are required.' });
@@ -1177,8 +1366,8 @@ if (enableAdminUI) {
         }
     });
 
-    // Modified install endpoint to use spawn and send SSE updates
-    app.post('/admin/server/install/:serverKey', isAuthenticated, async (req, res) => {
+    // Runs a backend's installCommands on the gateway host: opt-in.
+    if (adminFeatures.installRunner) app.post('/admin/server/install/:serverKey', isAuthenticated, async (req, res) => {
         const serverKey = req.params.serverKey;
         const adminSessionId = req.session.id; // Get current admin's session ID
         const clientId = req.ip || `admin-${Date.now()}`; // For logging
@@ -1312,17 +1501,19 @@ if (enableAdminUI) {
                             stdio: ['ignore', 'pipe', 'pipe']
                         });
 
-                        // Stream stdout
+                        // Output goes live to the admin's browser only. The journal
+                        // gets line counts: install output can carry tokens or
+                        // registry credentials, and the journal keeps them.
+                        let stdoutLines = 0, stderrLines = 0;
+                        const countLines = (text: string) => text.split('\n').filter(l => l.trim() !== '').length;
                         child.stdout.on('data', (data) => {
                             const output = data.toString();
-                            logger.log(`[${clientId}] Install stdout (${serverKey}): ${output.trim()}`);
+                            stdoutLines += countLines(output);
                             sendAdminSseEvent('install_stdout', { serverKey, output });
                         });
-
-                        // Stream stderr
                         child.stderr.on('data', (data) => {
                             const output = data.toString();
-                            logger.error(`[${clientId}] Install stderr (${serverKey}): ${output.trim()}`);
+                            stderrLines += countLines(output);
                             sendAdminSseEvent('install_stderr', { serverKey, output });
                         });
 
@@ -1335,6 +1526,7 @@ if (enableAdminUI) {
                             });
                         });
 
+                        logger.log(`[${clientId}] Install command for ${serverKey} exited with code ${exitCode} (${stdoutLines} stdout line(s), ${stderrLines} stderr line(s); output shown only in the admin UI).`);
                         if (exitCode !== 0) {
                             const errorMsg = `Command "${command}" failed with exit code ${exitCode}.`;
                             sendAdminSseEvent('install_error', { serverKey, error: errorMsg, command, exitCode });
@@ -1417,8 +1609,22 @@ if (enableAdminUI) {
         });
     });
 
-    // Mount the terminal router under /admin/terminal, protected by authentication
-    app.use('/admin/terminal', isAuthenticated, terminalRouter);
+    const broadcastAdminSse = (event: string, data: unknown) => {
+        const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+        for (const res of adminSseConnections.values()) { try { res.write(frame); } catch { /* closed */ } }
+    };
+    onBackendStateChanged((status) => broadcastAdminSse('backend_state', status));
+    onToolPinsChanged(() => {
+        const s = getToolPinState();
+        broadcastAdminSse('tool_pins_changed', { pending: 'pending' in s ? s.pending.length : 0 });
+    });
+
+    // A root shell in the browser: opt-in. When off, /admin/terminal/* is not
+    // mounted and the terminal module (and node-pty) is never loaded.
+    if (adminFeatures.terminal) {
+        terminalModule = await import('./terminal.js');
+        app.use('/admin/terminal', isAuthenticated, terminalModule.terminalRouter);
+    }
 
 
     // Static file serving for admin UI should also be inside the if block
@@ -1432,8 +1638,8 @@ if (enableAdminUI) {
         res.redirect('/admin/index.html');
     });
 
-} else { // Correctly placed else block for when Admin UI is disabled
-     console.log("Admin UI is DISABLED. Set ENABLE_ADMIN_UI=true to enable.");
+} else if (!adminUIRequested) {
+     logger.log("Admin UI is DISABLED. Set ENABLE_ADMIN_UI=true to enable.");
 } // End of the main if (enableAdminUI) block
 
 
@@ -1822,24 +2028,31 @@ app.post("/message", async (req, res) => {
 });
 
 
-const PORT = process.env.PORT || 3663;
+const PORT = Number(process.env.PORT) || 3663;
+// Optional bind address (default: all interfaces). The npx launcher sets
+// 127.0.0.1 so a trial gateway is not reachable from the network.
+const BIND_HOST = process.env.BIND_HOST?.trim() || undefined;
 
-expressServer.listen(PORT, () => {
-  const baseUrl = `http://localhost:${PORT}`;
+const onListening = () => {
+  const shownHost = !BIND_HOST || BIND_HOST === '0.0.0.0' || BIND_HOST === '::' ? 'localhost'
+    : BIND_HOST.includes(':') ? `[${BIND_HOST}]` : BIND_HOST;
+  const baseUrl = `http://${shownHost}:${PORT}`;
   logger.log(`Patchbay Gateway is running.`);
   logger.log(`SSE endpoint: ${baseUrl}/sse`);
   logger.log(`Streamable HTTP (MCP) endpoint: ${baseUrl}/mcp`);
 
   if (authEnabled && allowedKeys.size > 0) {
-    const firstKey = allowedKeys.values().next().value;
-    logger.log(`Example authenticated SSE endpoint: ${baseUrl}/sse?key=${firstKey}`);
-    logger.log(`Example authenticated MCP endpoint: ${baseUrl}/mcp?key=${firstKey} (or use X-Api-Key header)`);
+    // Endpoint shape only -- never log a real key (it would land in journald).
+    logger.log(`Example authenticated SSE endpoint: ${baseUrl}/sse?key=<your key>`);
+    logger.log(`Example authenticated MCP endpoint: ${baseUrl}/mcp?key=<your key> (or use X-Api-Key header)`);
   }
 
   if (enableAdminUI) {
       logger.log(`Admin UI available at ${baseUrl}/admin`);
   }
-});
+};
+if (BIND_HOST) expressServer.listen(PORT, BIND_HOST, onListening);
+else expressServer.listen(PORT, onListening);
 
 const shutdown = async (signal: string) => {
   logger.log(`\nReceived ${signal}. Shutting down gracefully...`);
@@ -1861,15 +2074,17 @@ const shutdown = async (signal: string) => {
     logger.log("Backend clients cleaned up.");
 
     // Kill any active terminal processes
-    logger.log("Killing active terminal sessions...");
-    // Add type annotations for the forEach callback parameters
-    activeTerminals.forEach((term: ActiveTerminal, id: string) => {
-        logger.log(`Killing terminal ${id} (PID: ${term.ptyProcess.pid})`);
-        term.ptyProcess.kill();
-    });
-    activeTerminals.clear();
-    TERMINAL_OUTPUT_SSE_CONNECTIONS.clear(); // Also clear SSE connections for terminals
-    logger.log("Active terminal sessions killed.");
+    if (terminalModule) {
+        const { activeTerminals, TERMINAL_OUTPUT_SSE_CONNECTIONS } = terminalModule;
+        logger.log("Killing active terminal sessions...");
+        activeTerminals.forEach((term, id) => {
+            logger.log(`Killing terminal ${id} (PID: ${term.ptyProcess.pid})`);
+            term.ptyProcess.kill();
+        });
+        activeTerminals.clear();
+        TERMINAL_OUTPUT_SSE_CONNECTIONS.clear(); // Also clear SSE connections for terminals
+        logger.log("Active terminal sessions killed.");
+    }
 
 
     logger.log("Closing HTTP server...");

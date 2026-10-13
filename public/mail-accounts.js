@@ -28,21 +28,28 @@ function renderMailAccountList(accounts) {
     accounts.forEach(acct => {
         const entry = document.createElement('div');
         entry.className = 'server-entry';
+        // Fixed markup only; account fields go in as text.
         entry.innerHTML = `
             <div class="server-header">
-                <h3>${escapeHtml(acct.name)}</h3>
-                <button class="edit-button" data-name="${escapeHtml(acct.name)}">Edit</button>
-                <button class="delete-button" data-name="${escapeHtml(acct.name)}">Delete</button>
+                <h3></h3>
+                <button class="edit-button">Edit</button>
+                <button class="delete-button">Delete</button>
             </div>
             <div class="server-details">
                 <label>IMAP:</label>
-                <p>${escapeHtml(acct.user)} @ ${escapeHtml(acct.imapHost)}:${acct.imapPort}${acct.imapSecure ? ' (TLS)' : ''}${acct.imapAllowInsecureTLS ? ' -- certificate NOT verified' : ''}</p>
+                <p class="mail-imap"></p>
                 <label>Sending:</label>
-                <p>${acct.smtpHost ? `Enabled via ${escapeHtml(acct.smtpHost)}:${acct.smtpPort}` : 'Disabled (no SMTP host set)'}</p>
+                <p class="mail-smtp"></p>
                 <label>Updated:</label>
-                <p>${new Date(acct.updatedAt).toLocaleString()}</p>
+                <p class="mail-updated"></p>
             </div>
         `;
+        entry.querySelector('h3').textContent = acct.name;
+        entry.querySelector('.edit-button').setAttribute('data-name', acct.name);
+        entry.querySelector('.delete-button').setAttribute('data-name', acct.name);
+        entry.querySelector('.mail-imap').textContent = `${acct.user} @ ${acct.imapHost}:${acct.imapPort}${acct.imapSecure ? ' (TLS)' : ''}${acct.imapAllowInsecureTLS ? ' -- certificate NOT verified' : ''}`;
+        entry.querySelector('.mail-smtp').textContent = acct.smtpHost ? `Enabled via ${acct.smtpHost}:${acct.smtpPort}` : 'Disabled (no SMTP host set)';
+        entry.querySelector('.mail-updated').textContent = new Date(acct.updatedAt).toLocaleString();
         listEl.appendChild(entry);
     });
 
