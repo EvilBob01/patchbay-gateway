@@ -146,6 +146,17 @@ A call to a backend that is down is not retried: it fails at once with error
 | `MCP_BACKEND_FLAP_WINDOW_MIN` | `10` | …within this many minutes is marked **failed** and no longer reconnected automatically. |
 | `MCP_BACKEND_RECONNECT_CONCURRENCY` | `3` | Most reconnect attempts in flight at once, across all backends. |
 
+### Health probes
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MCP_BACKEND_PROBE_INTERVAL_S` | `30` | Seconds between health probes of one backend (±10% jitter). `0` turns probes off. Fractions are allowed. |
+| `MCP_BACKEND_PROBE_TIMEOUT_MS` | `10000` | How long one probe waits for an answer. |
+| `MCP_BACKEND_PROBE_FAILURES` | `3` | Failed probes in a row that mark the backend down. |
+| `MCP_BACKEND_PROBE_CONCURRENCY` | `4` | Most probes in flight at once, across all backends. |
+
+See [Health probes and readiness](#health-probes-and-readiness).
+
 ### Admin UI features
 
 | Variable | Default | Meaning |
@@ -202,7 +213,7 @@ applies the change in-process. Only servers whose entry changed are reconnected.
       "type": "stdio",
       "name": "web01 (ssh)",
       "command": "npx",
-      "args": ["-y", "ssh-mcp", "--", "--host=192.0.2.10", "--user=ops", "--key=/home/patchbay/.ssh/id_ed25519", "--group=prod"],
+      "args": ["-y", "ssh-mcp@2.19.0", "--", "--host=192.0.2.10", "--user=ops", "--key=/home/patchbay/.ssh/id_ed25519", "--group=prod", "--disableApproval"],
       "env": {}
     },
     "files": {
@@ -236,6 +247,8 @@ backend name. Keys used with the install runner must match `^[a-zA-Z0-9_-]{1,64}
 | `active` | all | `false` (or `"false"`) keeps the entry but doesn't connect it. Default `true`. |
 | `lazy` | all | `true` lists only three meta-tools for this backend until a session activates it. See [Lazy backends](#lazy-backends). Default `false`. |
 | `description` | all | One line about the backend, shown in its lazy meta-tools' descriptions. |
+| `required` | all | Whether readiness (`GET /readyz`) waits for this backend. Default `true`, or `false` for a `lazy` backend. See [Health probes and readiness](#health-probes-and-readiness). |
+| `probe` | all | `false` turns the periodic health probe off for this backend. Default `true`. |
 | `command` | stdio | Executable to start. |
 | `args` | stdio | Argument array. |
 | `env` | stdio | Extra environment for the child, layered on the gateway's own environment. |
@@ -244,6 +257,70 @@ backend name. Keys used with the install runner must match `^[a-zA-Z0-9_-]{1,64}
 | `url` | sse, http | Backend endpoint. |
 | `bearerToken` | sse, http | Sent as `Authorization: Bearer …`. |
 | `apiKey` | sse, http | Sent as `X-Api-Key: …` when no `bearerToken` is set. |
+
+The admin UI's **Servers** tab edits the fields above except `required` and
+`probe`. Saving the tab keeps those, and any other field it doesn't show, as
+they are in the file, also when you rename a backend.
+
+**Saving from an outdated page is refused.** The **Servers** and **Tools** tabs and
+the Users tab's tool policy save the whole file from the copy the page loaded. If
+the file changed after that (another admin saved, or someone edited it on the
+gateway), the save is refused with *Not saved: This file changed on the gateway
+after this page loaded it…*, and nothing is written. Your edits stay on screen:
+copy what you need, reload the page, and make the change again. Without this, the
+older copy would silently undo the other change.
+
+A tab can save only what it loaded completely. Its Save button stays off while the
+file is loading and after a load fails, and a save attempted then is refused with
+*Not saved: … has not loaded …* and sends nothing: an error message on the page is
+never saved as an empty file. If a tab starts loading again before an earlier load
+finished, only the latest load counts. Reload the page once the gateway answers again.
+
+The check compares the file as the gateway reads it at save time. The gateway's own
+saves to one file run one at a time, but this is not a lock against other programs:
+an edit on the gateway made after that check is still overwritten.
+
+For scripts: `GET /admin/config`, `/admin/tools/config` and `/admin/tool-policy`
+return the file's revision in the `X-Config-Revision` header (`none` when the file
+doesn't exist yet). Send it back in the same header on the `POST` and the gateway
+answers `409` with `"code": "STALE_REVISION"` when the file has changed since; a
+successful save returns the new revision. A `POST` without the header is not
+checked.
+
+### Pinning backend versions
+
+`npx -y <package>` with no version resolves the package's latest release
+whenever npx decides to look it up again. A gateway restart can therefore start a
+newer backend than the one you tested, and a local patch applied to npx's cache
+(such as `npm run patch:legacy-ssh`) can silently disappear with it. For
+production, pin each backend:
+
+- **A version in the spec:** `"args": ["-y", "ssh-mcp@2.19.0", "--", …]`. This
+  is simple, but transitive dependencies still resolve freshly, and clearing
+  npm's cache re-downloads the package.
+- **A fixed install, launched with `node`:** install the package from a lockfile
+  into its own directory (`npm ci --omit=dev`), then point the backend at its
+  entry file:
+
+  ```json
+  "web01": {
+    "type": "stdio",
+    "command": "node",
+    "args": ["/opt/backends/ssh-mcp/2.19.0/node_modules/ssh-mcp/build/index.js",
+             "--host=192.0.2.10", "--user=ops", "--key=/home/patchbay/.ssh/id_ed25519"]
+  }
+  ```
+
+  Nothing is resolved at start-up, and the whole dependency tree is locked.
+  `patch:legacy-ssh` looks in its working directory, so run it from inside that
+  directory to patch that copy. It also patches any copies in npx's cache.
+
+The arguments after `--` in the `npx` form are the backend's own, and stay the
+same in the `node` form. Both forms keep the backend's kind: kind detection (used
+by [tool collapsing](#tool-collapsing) and the
+[trifecta section](#trifecta-section)) matches the package name as a path or
+spec segment, so `ssh-mcp@2.19.0` and `…/ssh-mcp/build/index.js` are both
+recognised as `ssh-mcp`.
 
 ### ssh-mcp host groups
 
@@ -255,12 +332,22 @@ comes from `--group=prod|staging|dev`; **without `--group` ssh-mcp uses `prod`**
 purpose, and any other value stops it from starting. `--disableApproval` runs
 destructive and sudo commands without the confirmation prompt (quick-start profile only).
 
+**Use `--disableApproval` behind this gateway.** With approval on, ssh-mcp asks the MCP
+client to confirm destructive and sudo commands and uploads (an MCP elicitation). The
+gateway does not pass that request on to its callers, so those calls are refused with
+`APPROVAL_UNAVAILABLE`. Newer ssh-mcp releases turn approval on by default
+(`approvalMode: ask-destructive`), so an entry without the flag and without a pinned
+version breaks as soon as npx picks up such a release. The gateway's tool policy,
+trifecta rules and audit log apply either way.
+
 The **Servers** tab shows each ssh-mcp backend's effective group and approval state as
 badges, warns when the group is `prod` only because `--group` is missing, and filters
 the list by group. Each ssh-mcp server has an **ssh-mcp policy** section: the group
 dropdown and approval toggle rewrite only the `--group=` and `--disableApproval` args,
 leaving every other argument and its position alone, and **Save & Reload** reconnects
-that backend. The **Add Server** wizard asks for a group and always writes `--group=`.
+that backend. The **Add Server** wizard asks for a group and always writes `--group=`,
+`--disableApproval` and a pinned `ssh-mcp@2.19.0`. The badge for a backend with approval
+on is a warning.
 
 A backend started with `--config=<file>.toml` keeps a group per `[[profiles]]` entry.
 The gateway reads that file read-only and returns only each profile's `name` and
@@ -506,9 +593,10 @@ re-fetch the tool list. OpenAI's Codex CLI only logs it. ChatGPT needs a manual
 ## Backend crash recovery
 
 The gateway watches every backend connection. A backend is **down** when its stdio
-process exits, its transport closes, or an HTTP backend fails a call at the
-transport level and then does not answer an MCP `ping`. A timeout alone never marks
-a backend down.
+process exits, its transport closes, an HTTP backend fails a call at the
+transport level and then does not answer an MCP `ping`, or it fails its periodic
+[health probe](#health-probes-and-readiness) several times in a row. A slow tool
+call alone never marks a backend down.
 
 - **Automatic reconnect.** A down backend is reconnected with exponential backoff:
   1 s, 2 s, 4 s … up to 60 s, each delay scaled by a random factor between 0.5 and
@@ -546,17 +634,100 @@ a backend down.
   waiting for a reload that removes its backend does not start it again.
 - **Admin.**
   - `GET /admin/server/status` lists each active backend with `state` (`up`,
-    `reconnecting`, `failed`), `since`, `attempt`, `nextRetryAt`, `lastError`,
-    `recentCrashes`, `transport` and `tools`, plus the settings above.
+    `reconnecting`, `failed`), `replacing` (see below), `since`, `attempt`, `nextRetryAt`, `lastError`,
+    `recentCrashes`, `transport`, `tools`, `required`, `lazy` and `probe`
+    (`enabled`, `lastAt`, `lastOk`, `lastMs`, `lastError`,
+    `consecutiveFailures`), plus `ready`, `initialized` and the settings above.
   - `POST /admin/server/reconnect/<name>` reconnects one backend now, in any state,
     and clears its crash history. It returns 200 if the backend came up, 502 if
     not (it then keeps retrying), and 404 for an unknown backend (or one a
     concurrent reload removed).
-  - The **Servers** tab shows a state dot per backend (hover for details) and a
+  - The **Servers** tab shows a state dot per backend (hover for details,
+    including the last health probe), a **required** / **optional** badge and a
     **Reconnect** button.
+- **Planned replacement.** A reload that changes a backend's config, the admin
+  reconnect, the SSE per-call reconnect and the mailbox editor close a working
+  connection on purpose. From the moment the old connection is closed until the
+  new one is up with its tools loaded, the backend is `reconnecting` with
+  `replacing` (`reload`, `admin` or `refresh`) in its status: it does not count as
+  up for `GET /readyz`, and calls get `-32013` with
+  `Backend "<name>" is reconnecting (config reload) since …` (and
+  `data.backendUnavailable.replacing`). The Servers tab shows
+  "reconnecting (config reload)" or "(admin reconnect)". It is not a crash: no
+  flap count and no `down` line. If the new connection fails, the backend gets a
+  `connect-failed` line and is retried with backoff like any failed connect.
 - **Logged and audited.** Each transition goes to the gateway log and the audit
-  log as `event: "backend"`: `down`, `connect-failed`, `reconnected`, `failed` and
-  `admin-reconnect`.
+  log as `event: "backend"`: `down`, `connect-failed`, `reconnected`, `failed`,
+  `admin-reconnect`, and `replacing` (with `by`) / `replaced` (with `by` and `ms`)
+  for a planned replacement. A `down` line also has `cause`: `exit` (stdio process
+  exited), `transport` (sse/http transport closed), `call` (an HTTP call failed
+  and the follow-up ping got no answer) or `probe` (the periodic health probe).
+
+## Health probes and readiness
+
+A backend can stay connected and still stop working: its process is alive but
+no longer answers MCP. Nothing in the crash detection above notices that, so the
+gateway also **probes** every backend that is up.
+
+- **What a probe is.** An MCP `ping` to the backend's current connection. A
+  backend that answers ping with "method not found" is probed with `tools/list`
+  from then on. ssh-mcp, and any server on the official MCP SDKs, answers ping.
+  A ping proves the backend's MCP loop answers. It does not prove that whatever
+  sits behind the backend (an SSH host, an API) is reachable.
+- **When.** Every 30 s per backend (`MCP_BACKEND_PROBE_INTERVAL_S`). The first
+  probe after a backend comes up is at a random point within the interval, and
+  later ones are 0.9–1.1 intervals apart, so a fleet connected together is not
+  probed together. At most 4 probes run at once (`MCP_BACKEND_PROBE_CONCURRENCY`).
+- **Failure.** A probe fails when it gets no answer within 10 s
+  (`MCP_BACKEND_PROBE_TIMEOUT_MS`) or gets an error. After 3 failures in a row
+  (`MCP_BACKEND_PROBE_FAILURES`) the backend is marked **down** with
+  `lastError` `probe: no answer (3 in a row): …`, and goes through the normal
+  [crash recovery](#backend-crash-recovery): reconnect with backoff, `-32013` for
+  calls meanwhile. It also counts as a crash for flap protection, so a backend
+  that keeps hanging ends up **failed**. A failed probe waits out its timeout
+  before the next interval starts, so with the defaults a hang is detected in
+  about 3 × (30 s + 10 s), roughly 2 minutes (measured on a 23-backend test gateway: 118 s). A
+  single failed probe is only logged.
+- **Never alongside a reconnect.** A probe needs the backend's connection lock
+  and does not wait for it: while a reconnect, reload or tool-pin re-check holds
+  it, that round is skipped. A backend that is reconnecting or failed is not
+  probed at all, and a removed backend stops being probed. A probe that was in
+  flight when the connection was replaced is ignored.
+- **Lazy backends** are connected like the others (lazy only hides their tools),
+  so they are probed too.
+- **Opting out.** `"probe": false` on a backend in `mcp_server.json` turns its
+  probe off; `MCP_BACKEND_PROBE_INTERVAL_S=0` turns all probes off.
+
+### Required and optional backends
+
+Each backend is **required** or **optional** (`required` in `mcp_server.json`).
+The default is required, except for `lazy` backends, which are optional.
+Readiness counts only required backends; an optional backend that is down is
+reported separately.
+
+### `GET /readyz`
+
+Always mounted (whether or not the admin UI is on), `Cache-Control: no-store`.
+`/healthz` is unchanged: it is liveness only and says nothing about backends.
+
+- **200** when the first config load has finished and **every required backend is
+  up**, else **503**. A required backend whose connection is being replaced (a
+  reload that changes it, an admin reconnect) is not up until its new connection
+  and tools are, so `/readyz` is 503 for that gap. Replacing an optional backend
+  leaves the gateway ready.
+- Without an admin session, the body has **counts only**, never a backend name:
+
+  ```json
+  {"ready":false,"initialized":true,"required":{"up":21,"total":22},"optional":{"up":1,"total":1}}
+  ```
+
+- With an admin session cookie it also has `notUp`: one
+  `{"backend","state","required"}` per backend that is not up. Never its last
+  error, which can name hosts and paths; that is in `GET /admin/server/status`.
+
+Use it as a deploy's success condition ("the gateway is serving and every
+required backend is up") or for a load balancer. `GET /admin/server/status`
+carries the same `ready` flag plus per-backend detail.
 
 ## Rug-pull protection
 
@@ -776,8 +947,10 @@ approval or rejection. See [Rug-pull protection](#rug-pull-protection).
 
 Backend crash recovery adds `"event":"backend"` lines with `action` (`down`,
 `connect-failed`, `reconnected`, `failed`, `admin-reconnect`), `backend`, and the
-detail for that action: `reason`, `recentCrashes`, `attempts`, `downMs`, `admin`,
-`ok`, `error`. See [Backend crash recovery](#backend-crash-recovery).
+detail for that action: `reason`, `recentCrashes`, `cause` (for `down`: `exit`,
+`transport`, `call` or `probe`), `attempts`, `downMs`, `admin`, `ok`, `error`. See
+[Backend crash recovery](#backend-crash-recovery) and
+[Health probes and readiness](#health-probes-and-readiness).
 
 Audit writes never fail a tool call. If the disk is unwritable the gateway logs the
 error and carries on.

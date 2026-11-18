@@ -6,7 +6,7 @@ a systemd service and a dedicated service user. It needs no containers.
 - [Quick start: the installer](#quick-start-the-installer)
 - [Checking the script before you run it](#checking-the-script-before-you-run-it)
 - [Installer options, upgrades and uninstalling](#installer-options-upgrades-and-uninstalling)
-- [Trying it locally with npx](#trying-it-locally-with-npx)
+- [Trying it locally from source](#trying-it-locally-from-source)
 - [Manual install](#manual-install)
 
 ## Quick start: the installer
@@ -66,7 +66,7 @@ Read it first:
    that **tag** rather than `main`, so you know exactly which version you are reading:
 
    ```bash
-   TAG=v1.1.0   # the release you picked
+   TAG=v1.2.0   # the release you picked
    curl -fsSLO "https://raw.githubusercontent.com/EvilBob01/patchbay-gateway/$TAG/scripts/install.sh"
    ```
 
@@ -100,6 +100,7 @@ Read it first:
 | `--uninstall` | Stop and remove the service, the code and `/opt/patchbay-gateway.previous`. Keeps the env file, `/var/lib/patchbay`, the audit log in `/var/log/patchbay-gateway` and the `patchbay` user. |
 | `--purge` | With `--uninstall`, also remove those. |
 | `--from-tarball <file>` | Install from a local source tarball (for testing unreleased code). |
+| `--terminal-sudo <mode>` | What the admin terminal may do as root: `scoped` (default), `full` or `none`. See [Terminal and sudo](#terminal-and-sudo). |
 
 **Upgrading:** run the installer again, optionally with `--version`. It builds the new
 version next to the old one, keeps the old one as `/opt/patchbay-gateway.previous`,
@@ -123,6 +124,26 @@ kept: the next upgrade replaces it.
 The installer only manages a directory it created (it leaves a `.patchbay-installer`
 marker). It refuses to touch an existing `/opt/patchbay-gateway` from a manual install;
 upgrade that one as in [§7](#7-upgrading).
+
+### Terminal and sudo
+
+The gateway runs as the `patchbay` user, and so does the admin **Terminal** when you
+turn it on (`PATCHBAY_ENABLE_TERMINAL=true`): it is that user's shell, not root's. What
+it may do as root is set by `--terminal-sudo`:
+
+| Mode | `/etc/sudoers.d/patchbay-gateway` | Use it when |
+|---|---|---|
+| `scoped` (default) | No password, and only `systemctl restart patchbay-gateway`, `systemctl --no-pager status patchbay-gateway` and `journalctl --no-pager -u patchbay-gateway -n 200` | You want to restart the service and read its log from the browser, nothing more |
+| `full` | Anything, after typing **root's** password (`Defaults:patchbay rootpw`). Set one with `passwd root` if the box has none | The terminal is your way into the box |
+| `none` | No file | No sudo from the browser at all |
+
+- **`NoNewPrivileges`.** The unit ships with `NoNewPrivileges=true`, which blocks `sudo` for the whole service. While the terminal is on, the installer adds `/etc/systemd/system/patchbay-gateway.service.d/10-terminal-sudo.conf` to relax it:
+  - with `full`, the drop-in also lifts `ProtectSystem`, so root in the terminal is real root;
+  - with the terminal off, there is no drop-in, and the service keeps the full sandbox.
+- **Turning the terminal on later?** Set `PATCHBAY_ENABLE_TERMINAL=true` in the env file, then re-run the installer (same version is fine) so it adds the drop-in.
+- **`full` is a choice, not a default.** Any process in the service can run `sudo`. The `rootpw` rule is what stops a compromised backend from escalating without the root password.
+- **No sudo installed.** `scoped` installs leave the terminal without sudo and say so. Install `sudo` and re-run to get it.
+- **Every run reconciles.** The installer works out what should exist from `--terminal-sudo`, whether `sudo` is installed and whether the terminal is on, then adds, rewrites or removes the sudoers file and the drop-in to match. A re-run with `none`, or on a box where `sudo` is gone, removes both, so an earlier `full` install leaves nothing behind; a re-run with the terminal off removes the drop-in.
 
 `--uninstall` never removes Node.js or other packages. If the installer added the
 NodeSource repository, `/etc/apt/sources.list.d/nodesource.list` and
@@ -169,12 +190,16 @@ checkout with `git archive --prefix=patchbay-gateway/ -o source.tgz HEAD`.
 | Devuan 5 | **Not supported** | No systemd. The installer refuses before changing anything and says so. Use the [manual install](#manual-install) with your own init script, or `npx`. |
 | Fedora, other RHEL-likes | Best-effort | Untested. |
 
-## Trying it locally with npx
+## Trying it locally from source
 
-On any machine with Node.js 20+ (Linux, macOS or Windows):
+On any machine with Git and Node.js 20+ (Linux, macOS or Windows):
 
 ```bash
-npx patchbay-gateway
+git clone --branch v1.2.0 --single-branch https://github.com/EvilBob01/patchbay-gateway.git
+cd patchbay-gateway
+npm ci --ignore-scripts
+npm run build
+node build/cli.js --host 127.0.0.1
 ```
 
 On first run this creates `~/.patchbay-gateway/` (config, audit log, `gateway.env` with
@@ -189,13 +214,18 @@ binds to `127.0.0.1` so a trial is not reachable from the network.
 | `--data-dir <dir>` | Data directory (default `~/.patchbay-gateway`, or `PATCHBAY_HOME`). |
 | `stdio` | Run as a single stdio MCP server instead (for a client to spawn). |
 
-Variables already set in your environment win over `gateway.env`. The admin terminal is
+The npm package is not published. In Windows PowerShell, use `npm.cmd` if execution
+policy blocks `npm`. `--ignore-scripts` avoids optional native-module compilation;
+the explicit build compiles the gateway itself.
+
+Variables already set in your environment win over `gateway.env`. Use a fresh shell
+for a first trial. The admin terminal is
 off unless you set `PATCHBAY_ENABLE_TERMINAL=true` in `gateway.env`; it also
 needs the optional native module `node-pty`. If your machine can't build it, everything
 else still works and the terminal says it is unavailable.
 
-> The `patchbay-gateway` npm package is not published yet. Until it is, clone the
-> repository and run `npm install && node build/cli.js` for the same behaviour.
+Stop with Ctrl+C; the data directory is retained for your next run. For a demo
+with simulated servers and disposable data, see [demo.md](demo.md) (v1.2.0 and later).
 
 ## Manual install
 
@@ -363,10 +393,24 @@ LogsDirectoryMode=0750
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+# Read-only OS for the service: it writes only its data dir, the log dir
+# (LogsDirectory) and its private /tmp. The admin terminal's sudo needs a
+# drop-in that relaxes NoNewPrivileges (scripts/install.sh --terminal-sudo;
+# docs/install.md, Terminal and sudo).
+ProtectSystem=strict
+ReadWritePaths=/var/lib/patchbay
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+`ProtectSystem=strict` makes everything outside `ReadWritePaths=` read-only to the
+service.
+- **Config in the code directory.** If you kept the config in `/opt/patchbay-gateway/config` (no `PATCHBAY_CONFIG_DIR`), add `ReadWritePaths=/opt/patchbay-gateway/config`. Without it, admin UI saves fail.
+- **Admin terminal with sudo.** See [Terminal and sudo](#terminal-and-sudo) for the drop-in it needs.
 
 ```bash
 sudo systemctl daemon-reload
@@ -449,6 +493,17 @@ users, policy, layout, mailboxes) are ignored by git and survive upgrades. Read
 
 A restart drops open MCP sessions (clients reconnect) and logs admins out (the session
 store is in memory). Backend-only changes never need a restart: use **Reload**.
+
+**A box that runs the gateway as root** (installed by hand before 1.1, with no `User=`
+in the unit) can move to a service user without reinstalling. The move takes these steps:
+1. Create the `patchbay` user.
+2. Move the runtime config to `/var/lib/patchbay/config` (`PATCHBAY_CONFIG_DIR`).
+3. Copy the backends' SSH keys into `/var/lib/patchbay/.ssh` and point `--key=` at them.
+4. Make the code readable to the service and give it the audit log directory.
+5. Add `User=`/`Group=`/`HOME` with a drop-in.
+
+The result is the installer's layout. Back up the env file, the unit and `config/` first,
+and verify that every backend comes back as the new user before you rely on it.
 
 ### 8. Troubleshooting
 

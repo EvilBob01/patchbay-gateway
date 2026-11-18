@@ -6,6 +6,13 @@
     let step = 1;
     const TOTAL = 4;
 
+    // ssh-mcp version new SSH hosts run. A bare "ssh-mcp" starts whatever npm has
+    // as latest, and newer releases ask for approval of destructive commands and
+    // uploads through the MCP client by default. This gateway doesn't pass that
+    // request on, so those calls would always be refused (APPROVAL_UNAVAILABLE);
+    // hence also --disableApproval. The gateway's own policy and trifecta still apply.
+    const SSH_MCP_SPEC = 'ssh-mcp@2.19.0';
+
     const $ = (id) => document.getElementById(id);
     const modal = () => $('wizard-modal');
 
@@ -88,7 +95,7 @@
                     name: key,
                     active: true,
                     command: 'npx',
-                    args: ['ssh-mcp', '-y', '--', `--host=${host}`, `--port=${port}`, `--user=${user}`, `--key=${keyPath}`, '--maxChars=none', '--timeout=600000', `--group=${group}`],
+                    args: ['-y', SSH_MCP_SPEC, '--', `--host=${host}`, `--port=${port}`, `--user=${user}`, `--key=${keyPath}`, '--maxChars=none', '--timeout=600000', `--group=${group}`, '--disableApproval'],
                     env: {},
                     installDirectory: '' // ssh-mcp needs no install dir; keep config clean
                 }
@@ -184,6 +191,9 @@
     async function finish() {
         const { key, conf } = buildConfig();
         if (typeof window.renderServerEntry !== 'function') { setError('Internal error: server list not ready.'); return; }
+        // Finish saves the Servers tab; that needs a server list loaded completely.
+        const blocked = typeof window.serverSaveBlockedReason === 'function' ? window.serverSaveBlockedReason() : 'Internal error: server list not ready.';
+        if (blocked) { setError(blocked); return; }
         // Guard against clobbering an existing server key.
         const existing = document.querySelector(`.server-entry .server-key-input[value="${key}"]`);
         if (existing) { setError(`A server named "${key}" already exists — pick another name.`); goStep(1); return; }

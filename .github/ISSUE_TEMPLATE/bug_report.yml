@@ -1,0 +1,30 @@
+name: Report a problem
+description: Something failed, was confusing, or did not work as expected.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying Patchbay. An incomplete report is welcome.
+        This report will be public. Remove tokens, passwords, private hostnames and addresses, email addresses, and raw configuration before posting. Share only a small, sanitized log excerpt if it helps.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: What were you trying to do, what happened, and what did you expect? Steps to reproduce help if you have them.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Patchbay version
+      placeholder: For example, 1.1.0, or a commit for a development build
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: OS, Node version, install method, and MCP client/version if known
+  - type: textarea
+    id: details
+    attributes:
+      label: Anything else that would help?
+      description: Backend package/version, a small sanitized example, workaround, or screenshot. Please inspect screenshots for secrets too.

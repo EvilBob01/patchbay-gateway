@@ -1,0 +1,23 @@
+name: Suggest a feature
+description: Tell us what you want to accomplish or where Patchbay gets in your way.
+body:
+  - type: markdown
+    attributes:
+      value: Your use case matters more than a proposed implementation. This is public; omit credentials and private infrastructure details.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: What is difficult or missing today? A concrete example helps.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+      description: Optional. Your current workaround is useful too.
+  - type: input
+    id: version
+    attributes:
+      label: Patchbay version
+      placeholder: Optional

@@ -7,10 +7,26 @@ const saveToolConfigButton = document.getElementById('save-tool-config-button');
 let serverToolnameSeparator = '__'; // Default separator
 
 // --- Tool Configuration Management ---
+// Save replaces the whole tool_config.json with what this page shows, so it is
+// allowed only while the page shows the result of one complete load, with that
+// load's revision ("none" for a file that doesn't exist yet). Loads can overlap
+// (a tab click while one is still running), so each load takes a generation
+// number and only the newest may render, enable Save or report an error; an
+// older load's late success or failure changes nothing.
+let toolLoadGeneration = 0;
+
+function invalidateToolSnapshot() {
+    window.toolDataLoaded = false;
+    window.toolConfigRevision = null;
+    if (saveToolConfigButton) saveToolConfigButton.disabled = true;
+}
+
 async function loadToolData() {
     if (!saveToolStatus || !toolListDiv) return; // Guard
+    const generation = ++toolLoadGeneration;
+    const isCurrent = () => generation === toolLoadGeneration;
     saveToolStatus.textContent = 'Loading tool data...';
-    window.toolDataLoaded = false; // Reset flag during load attempt (use global flag)
+    invalidateToolSnapshot();
     try {
         // Fetch discovered tools, tool config, and environment info concurrently
         const [toolsResponse, configResponse, envResponse] = await Promise.all([
@@ -23,26 +39,34 @@ async function loadToolData() {
         if (!configResponse.ok) throw new Error(`Failed to fetch tool config: ${configResponse.statusText}`);
         if (!envResponse.ok) throw new Error(`Failed to fetch environment info: ${envResponse.statusText}`); // Check env response
 
+        // Stage everything locally; nothing on the page changes until all of it is valid.
         const toolsResult = await toolsResponse.json();
-        window.discoveredTools = toolsResult.tools || []; // Expecting { tools: [...] } (use global var)
-
-        window.currentToolConfig = await configResponse.json(); // Use global var
-        if (!window.currentToolConfig || typeof window.currentToolConfig !== 'object' || !window.currentToolConfig.tools) {
-             console.warn("Received invalid tool configuration format, initializing empty.", window.currentToolConfig);
-         window.currentToolConfig = { tools: {} }; // Initialize if invalid or empty
+        // Sent back on Save: the gateway refuses a save from an older copy (409).
+        const revision = configResponse.headers.get('X-Config-Revision');
+        if (!revision) throw new Error('the gateway sent no configuration revision');
+        const toolConfig = await configResponse.json();
+        if (!toolConfig || typeof toolConfig !== 'object' || !toolConfig.tools || typeof toolConfig.tools !== 'object') {
+            // Saving would replace the file with whatever this page made of it.
+            throw new Error('tool_config.json has no "tools" object');
         }
-
         const envResult = await envResponse.json(); // Parse environment info
+
+        if (!isCurrent()) return; // a newer load owns the page
+        window.discoveredTools = toolsResult.tools || []; // Expecting { tools: [...] } (use global var)
+        window.currentToolConfig = toolConfig;
         serverToolnameSeparator = envResult.serverToolnameSeparator || '__'; // Update separator
         console.log(`Using server toolname separator from backend: "${serverToolnameSeparator}"`);
-
         renderTools(); // Render using both discovered and configured data
-        window.toolDataLoaded = true; // Set global flag only after successful load and render
+        window.toolDataLoaded = true; // Set only after a complete load and render
+        window.toolConfigRevision = revision;
+        if (saveToolConfigButton) saveToolConfigButton.disabled = false;
         saveToolStatus.textContent = 'Tool data loaded.';
-        setTimeout(() => saveToolStatus.textContent = '', 3000);
+        clearStatusLater(saveToolStatus, 3000);
 
     } catch (error) {
+        if (!isCurrent()) return; // a newer load owns the page
         console.error("Error loading tool data:", error);
+        invalidateToolSnapshot();
         saveToolStatus.textContent = `Error loading tool data: ${error.message}`;
         toolListDiv.innerHTML = '<p class="error-message">Could not load tool data.</p>';
     }
@@ -178,7 +202,7 @@ function renderToolEntry(toolKey, toolDefinition, toolConfig, isConfigOnly = fal
                     if (window.saveToolStatus) { // Ensure saveToolStatus is accessed via window or defined in this scope
                         window.saveToolStatus.textContent = `Overrides for '${toolKey}' reset. Click "Save & Reload" to apply.`;
                         window.saveToolStatus.style.color = 'orange';
-                        setTimeout(() => { if (window.saveToolStatus) window.saveToolStatus.textContent = ''; }, 5000);
+                        clearStatusLater(window.saveToolStatus, 5000);
                     }
                 } else {
                     // If the toolKey wasn't in currentToolConfig.tools, it means it was already using defaults.
@@ -208,6 +232,13 @@ function initializeToolSaveListener() {
     const validToolNameRegex = /^[a-zA-Z_][a-zA-Z0-9_-]*$/;
 
     saveToolConfigButton.addEventListener('click', async () => {
+        if (!window.toolDataLoaded || !window.toolConfigRevision) {
+            // A failed or unfinished load: never turn an error page into a file.
+            saveToolStatus.textContent = 'Not saved: The tool configuration has not loaded, so this page has nothing it can safely save. Reload the page.';
+            saveToolStatus.style.color = 'red';
+            return;
+        }
+        const generation = toolLoadGeneration; // a load started meanwhile owns the page's state
         saveToolStatus.textContent = 'Validating and saving tool configuration...';
         saveToolStatus.style.color = 'orange';
         const newToolConfig = { tools: {} };
@@ -272,23 +303,33 @@ function initializeToolSaveListener() {
         if (!isValid) {
             saveToolStatus.textContent = `Error: ${errorMsg}`;
             saveToolStatus.style.color = 'red';
-            setTimeout(() => { if(saveToolStatus) saveToolStatus.textContent = ''; saveToolStatus.style.color = 'green'; }, 7000);
+            clearStatusLater(saveToolStatus, 7000, 'green');
             return;
         }
 
         // Proceed to save if valid
         try {
             saveToolStatus.textContent = 'Saving tool configuration...'; // Update status after validation
+            const headers = { 'Content-Type': 'application/json', 'X-Config-Revision': window.toolConfigRevision };
             const response = await fetch('/admin/tools/config', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers,
                 body: JSON.stringify(newToolConfig)
             });
             const result = await response.json();
+            if (response.status === 409) {
+                saveToolStatus.textContent = `Not saved: ${result.error}`;
+                saveToolStatus.style.color = 'red';
+                return;
+            }
             if (response.ok && result.success) {
+                if (generation === toolLoadGeneration) {
+                    // The page still shows what was just saved: that is its new revision.
+                    window.toolConfigRevision = response.headers.get('X-Config-Revision') || window.toolConfigRevision;
+                    window.currentToolConfig = newToolConfig; // Update global state
+                }
                 saveToolStatus.textContent = 'Tool configuration saved successfully.';
                 saveToolStatus.style.color = 'green';
-                window.currentToolConfig = newToolConfig; // Update global state
 
                 // Trigger reload after successful save (assumes triggerReload is global)
                  if (typeof window.triggerReload === 'function') {
@@ -297,19 +338,19 @@ function initializeToolSaveListener() {
                      console.error("triggerReload function not found.");
                      saveToolStatus.textContent += ' Reload trigger function not found!';
                      saveToolStatus.style.color = 'red';
-                     setTimeout(() => { saveToolStatus.textContent = ''; saveToolStatus.style.color = 'green'; }, 7000);
+                     clearStatusLater(saveToolStatus, 7000, 'green');
                  }
 
             } else {
                 saveToolStatus.textContent = `Error saving tool configuration: ${result.error || response.statusText}`;
                 saveToolStatus.style.color = 'red';
-                 setTimeout(() => { saveToolStatus.textContent = ''; saveToolStatus.style.color = 'green'; }, 5000);
+                 clearStatusLater(saveToolStatus, 5000, 'green');
             }
         } catch (error) {
             console.error("Error saving tool config:", error);
             saveToolStatus.textContent = `Network error saving tool configuration: ${error.message}`;
             saveToolStatus.style.color = 'red';
-             setTimeout(() => { saveToolStatus.textContent = ''; saveToolStatus.style.color = 'green'; }, 5000);
+             clearStatusLater(saveToolStatus, 5000, 'green');
         }
     });
 }
@@ -343,7 +384,7 @@ function initializeResetAllToolOverridesListener() {
                 if (localSaveToolStatus) {
                     localSaveToolStatus.textContent = 'All tool overrides have been reset. Click "Save & Reload" to apply.';
                     localSaveToolStatus.style.color = 'orange';
-                    setTimeout(() => { if (localSaveToolStatus) localSaveToolStatus.textContent = ''; }, 7000);
+                    clearStatusLater(localSaveToolStatus, 7000);
                 }
                 // Consider adding a global dirty flag if not already handled by the main save logic
                 // e.g., window.isToolConfigDirty = true; 

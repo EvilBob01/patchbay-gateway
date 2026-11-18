@@ -4,7 +4,7 @@
 // it that act on the gateway host or on other hosts are opt-in on top of that,
 // each with its own switch, all off by default:
 //
-//   PATCHBAY_ENABLE_TERMINAL        a root shell in the browser (/admin/terminal)
+//   PATCHBAY_ENABLE_TERMINAL        a shell in the browser, as the service user (/admin/terminal)
 //   PATCHBAY_ENABLE_INSTALL_RUNNER  runs a backend's installCommands
 //   PATCHBAY_ENABLE_DEPLOY_KEYS     pushes this gateway's SSH key to a host
 //

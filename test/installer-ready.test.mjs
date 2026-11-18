@@ -70,30 +70,55 @@ async function healthz(delayMs) {
   };
 }
 
+/**
+ * What one curl costs on this machine beyond its own --max-time: process start and,
+ * on Windows, connection set-up can take over a second under load. Measured in the
+ * same bash as the wait, against a server that never answers, so a bound can allow
+ * for it without losing the point of the test (the wait must not outlast its
+ * timeout by more than that overhead). 0 when curl is as fast as it should be.
+ */
+async function curlOverheadMs() {
+  const s = await healthz(Infinity);
+  try {
+    const r = spawnSync(BASH, ['--noprofile', '--norc', '-c',
+      `t0=$(date +%s%N); curl -s -o /dev/null --max-time 1 '${s.url}'; echo $(( ($(date +%s%N) - t0) / 1000000 ))`],
+      { encoding: 'utf8', timeout: 15000 });
+    return Math.max(0, Number(r.stdout.trim()) - 1000);
+  } finally { await s.close(); }
+}
+
+/** The bound for a wait of `timeout` s: 1.5 s grace plus two curls' overhead. */
+const boundMs = (timeout, overhead) => timeout * 1000 + 1500 + 2 * overhead;
+
+// The server delay (15 s) is far above any bound here, so a wait that ignored its
+// deadline (the original R3 bug: curl without --max-time) still fails clearly.
 test('R3: a /healthz slower than the timeout fails within about the timeout', { skip }, async () => {
-  const s = await healthz(6000);
+  const overhead = await curlOverheadMs();
+  const s = await healthz(15000);
   try {
     const { rc, ms, stderr } = await runWait(s.url, 2);
     assert.equal(rc, 1, stderr);
-    assert.ok(ms < 3500, `took ${ms} ms for a 2 s timeout`);
+    assert.ok(ms < boundMs(2, overhead), `took ${ms} ms for a 2 s timeout (bound ${boundMs(2, overhead)} ms; curl overhead here ${overhead} ms)`);
   } finally { await s.close(); }
 });
 
 test('R3: a /healthz that never answers fails within about the timeout', { skip }, async () => {
+  const overhead = await curlOverheadMs();
   const s = await healthz(Infinity);
   try {
     const { rc, ms, stderr } = await runWait(s.url, 2);
     assert.equal(rc, 1, stderr);
-    assert.ok(ms < 3500, `took ${ms} ms for a 2 s timeout`);
+    assert.ok(ms < boundMs(2, overhead), `took ${ms} ms for a 2 s timeout (bound ${boundMs(2, overhead)} ms; curl overhead here ${overhead} ms)`);
   } finally { await s.close(); }
 });
 
 test('R3: a /healthz that answers at once, or slowly within the budget, succeeds', { skip }, async () => {
+  const overhead = await curlOverheadMs();
   const fast = await healthz(0);
   try {
     const { rc, ms, stderr } = await runWait(fast.url, 5);
     assert.equal(rc, 0, stderr);
-    assert.ok(ms < 3000, `took ${ms} ms`);
+    assert.ok(ms < 3000 + overhead, `took ${ms} ms (bound ${3000 + overhead} ms; curl overhead here ${overhead} ms)`);
   } finally { await fast.close(); }
   const slow = await healthz(1500);
   try {

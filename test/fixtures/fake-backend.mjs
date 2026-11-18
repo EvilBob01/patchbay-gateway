@@ -17,6 +17,12 @@
 //   --crashable  one more tool, crash, that exits the process mid-call
 //   --fail-if=<file>  exit at once, before speaking MCP, while <file> exists
 //            (a backend that cannot be (re)connected)
+//   --hang-if-pid=<file>  hang: while <file> holds this process's pid, every
+//            incoming request (ping included) is swallowed unanswered, but the
+//            process stays alive and connected (health-probe tests)
+//   --pinglog=<file>  append a line to <file> for every ping received
+//   --no-ping  answer ping with "method not found" (-32601)
+//   --start-delay-ms=<n>  wait n ms before speaking MCP (a slow (re)connect)
 //   --defs=<file>  patch the tool set from a JSON file, re-read on every
 //            tools/list: {"<tool>": {fields to merge} | null (removes it),
 //            "+<tool>": {description, inputSchema?} (adds one)}. When the file
@@ -24,7 +30,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { readFileSync, watchFile, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, watchFile, writeFileSync, existsSync, appendFileSync } from 'node:fs';
 
 const argv = process.argv.slice(2);
 const name = (argv.find(a => a.startsWith('--name=')) || '--name=?').slice('--name='.length);
@@ -98,4 +104,27 @@ const echo = (req) => ({
     { type: 'text', text: 'end' },
   ],
 });
-await server.connect(new StdioServerTransport());
+const hangIfPid = argValue('--hang-if-pid');
+const pinglog = argValue('--pinglog');
+const noPing = argv.includes('--no-ping');
+const startDelay = Number(argValue('--start-delay-ms') || 0);
+if (startDelay > 0) await new Promise(r => setTimeout(r, startDelay));
+const transport = new StdioServerTransport();
+await server.connect(transport);
+if (hangIfPid || pinglog || noPing) {
+  const hanging = () => {
+    try { return existsSync(hangIfPid) && readFileSync(hangIfPid, 'utf-8').trim() === String(process.pid); } catch { return false; }
+  };
+  const deliver = transport.onmessage;
+  transport.onmessage = (msg, extra) => {
+    if (hangIfPid && msg.id !== undefined && hanging()) return; // never answered
+    if (msg.method === 'ping') {
+      if (pinglog) appendFileSync(pinglog, '1\n');
+      if (noPing) {
+        transport.send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'Method not found' } }).catch(() => {});
+        return;
+      }
+    }
+    deliver(msg, extra);
+  };
+}

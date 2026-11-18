@@ -115,9 +115,11 @@
         gateway starts it as <strong>admin</strong>: on <strong>dev</strong> and <strong>staging</strong> admin may run
         every command class, including sudo (<code>privileged-command</code>); on <strong>prod</strong> admin gets
         read-only, safe and destructive commands but <strong>no sudo</strong>. A missing <code>--group</code> means
-        prod, deliberately, so an unlabelled host gets the strictest tier. With approval on, destructive and
-        sudo commands ask for confirmation through the MCP client (a client that cannot ask gets a refusal);
-        <code>--disableApproval</code> runs them without asking. Source: ssh-mcp README, “Policy Engine” and “CLI Flags”.`;
+        prod, deliberately, so an unlabelled host gets the strictest tier. With approval on, ssh-mcp asks
+        the MCP client to confirm destructive and sudo commands and uploads. <strong>This gateway does not pass
+        that request on to its callers</strong>, so with approval on those calls are refused
+        (<code>APPROVAL_UNAVAILABLE</code>). <code>--disableApproval</code> runs them without asking; the gateway's
+        tool policy, trifecta rules and audit log still apply. Source: ssh-mcp README, “Policy Engine” and “CLI Flags”.`;
 
     const DEFAULT_PROD_TITLE = 'No --group: ssh-mcp treats this host as prod, the strictest tier. admin gets no sudo (privileged-command) here.';
 
@@ -141,7 +143,7 @@
             else g = badge(d.group, `g-${d.group}`, `ssh-mcp host group (--group=${d.group})`);
             const a = d.disableApproval
                 ? badge('approval off', 'muted', '--disableApproval: destructive and sudo commands run without a confirmation prompt')
-                : badge('approval on', 'muted', 'Destructive and sudo commands ask for confirmation through the MCP client');
+                : badge('approval on ⚠', 'warn', 'ssh-mcp asks the MCP client to confirm destructive and sudo commands and uploads. This gateway does not pass that request on, so those calls are refused (APPROVAL_UNAVAILABLE).');
             return g + a;
         }
         if (d.mode === 'default-config') return badge('ssh-mcp default config', 'muted', 'No --host/--user and no --config: ssh-mcp reads its own default config file, which the gateway does not inspect.');

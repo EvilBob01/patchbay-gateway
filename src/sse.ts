@@ -11,7 +11,7 @@ import { promisify } from 'util';
 // Import the necessary functions from mcp-proxy and config
 import { createServer, updateBackendConnections, getCurrentProxyState, refreshBackendConnection, setSessionIdentity, clearSessionIdentity, getSessionIdentity,
     getToolPinState, approveToolPin, rejectToolPin, approveBackendToolPins, recheckToolPins, onToolPinsChanged,
-    getBackendStatus, reconnectBackendNow, onBackendStateChanged } from "./mcp-proxy.js";
+    getBackendStatus, reconnectBackendNow, onBackendStateChanged, getReadiness } from "./mcp-proxy.js";
 import { PinError, pinsConfigSummary } from './toolPins.js';
 import { resolveIdentity, ANONYMOUS_IDENTITY, UNKNOWN_IDENTITY, type CallerIdentity } from './identity.js';
 import { compilePolicy, readPolicyFile, writePolicyFile, TOOL_POLICY_PATH } from './policy.js';
@@ -27,11 +27,13 @@ import { Tool, ListToolsResultSchema, JSONRPCMessage, JSONRPCError } from "@mode
 // Import loadToolConfig as well
 import { Config, loadConfig, isStdioConfig, loadToolConfig } from './config.js';
 import { logger } from './logger.js';
+import { VERSION } from './version.js';
 import { pathDefault, configPath } from './paths.js';
-// The terminal module (a root PTY in the browser) is imported further down,
+// The terminal module (a shell PTY in the browser) is imported further down,
 // and only when PATCHBAY_ENABLE_TERMINAL is on.
 import { envFlag, readAdminFeatures, describeAdminFeatures, adminPasswordProblem, disabledMessage, FEATURE_ENV } from './adminFeatures.js';
 import { loadUsers, saveUsers, generateToken, UserRecord } from './users.js';
+import { REVISION_HEADER, revisionOf, readWithRevision, expectedRevision, assertFresh, withFileLock, StaleRevisionError } from './fileRevision.js';
 import { listMailAccountsSafe, upsertMailAccount, deleteMailAccount, testMailAccountConnection, validateAccountName } from './mailAccounts.js';
 import { deployKeyToHost, getGatewayPublicKey, PRIVATE_KEY_PATH } from './deployKey.js';
 import { maskConfigSecrets, mergeConfigSecrets, MaskedSecretError } from './configSecrets.js';
@@ -550,10 +552,11 @@ if (enableAdminUI) {
             // UI. See deploy/patchbay-gateway.env.example.
             secure: process.env.NODE_ENV === 'production',
             httpOnly: true,
-            // The real CSRF defence here. The admin UI hands out a root PTY, so a
+            // The real CSRF defence here. The admin UI hands out a shell PTY, so a
             // single forged cross-site POST from a logged-in admin's browser is
-            // full root on this container. 'strict' stops the browser attaching
-            // this cookie to *any* cross-site request. Safe because the admin UI
+            // a shell on this container (root too, if the terminal has sudo).
+            // 'strict' stops the browser attaching this cookie to *any*
+            // cross-site request. Safe because the admin UI
             // is same-origin with these routes, and MCP clients authenticate with
             // Bearer/X-Api-Key headers rather than this cookie.
             sameSite: 'strict',
@@ -590,10 +593,15 @@ if (enableAdminUI) {
 
     // Public (no auth): lets the login page identify which gateway this is, so an
     // admin with several identical IP-only tabs open doesn't type creds into the
-    // wrong one. Exposes only the gateway's friendly name + accent color, both of
-    // which are non-secret (the name already appears in every client's config URL).
+    // wrong one. Name and accent only: the release version is behind login
+    // (/admin/version) so the login page doesn't tell scanners what to target.
     app.get('/admin/info', (req, res) => {
         res.json({ name: GATEWAY_CLIENT_NAME, color: GATEWAY_UI_COLOR });
+    });
+
+    // Release version for the feedback links in the admin footer.
+    app.get('/admin/version', isAuthenticated, (req, res) => {
+        res.json({ version: VERSION });
     });
 
     // Which opt-in admin features are on, so the UI can hide the rest. A feature
@@ -724,7 +732,7 @@ if (enableAdminUI) {
     // process, which is the same lifetime as the session store above, and these
     // gateways run a single process. Admin credentials are a single shared
     // username/password, so an unthrottled login endpoint is the cheapest path to
-    // a root PTY on this container.
+    // a shell PTY on this container (as the service user; root only through sudo).
     const LOGIN_MAX_ATTEMPTS = Number(process.env.ADMIN_LOGIN_MAX_ATTEMPTS) || 10;
     const LOGIN_WINDOW_MS = (Number(process.env.ADMIN_LOGIN_WINDOW_MINUTES) || 15) * 60 * 1000;
     const loginAttempts = new Map<string, { count: number; first: number }>();
@@ -814,8 +822,11 @@ if (enableAdminUI) {
         try {
             logger.log("Admin request: GET /admin/config");
             // Backend secrets go out masked (configSecrets.ts); POST puts them back.
-            const configData = JSON.parse(await readFile(CONFIG_PATH, 'utf-8'));
+            const { text, revision } = await readWithRevision(CONFIG_PATH);
+            if (text === null) return res.status(404).json({ error: 'Configuration file not found.' });
+            const configData = JSON.parse(text);
             res.setHeader('Cache-Control', 'no-store');
+            res.setHeader(REVISION_HEADER, revision);
             res.json(maskConfigSecrets(configData));
         } catch (error: any) {
             logger.error(`Error reading config file at ${CONFIG_PATH}:`, error);
@@ -836,26 +847,25 @@ if (enableAdminUI) {
                 return res.status(400).json({ error: 'Invalid configuration format: Expected a JSON object.' });
             }
 
-            // Masked values from GET mean "keep what's stored": swap them back in.
-            let storedConfig: any = {};
-            try {
-                storedConfig = JSON.parse(await readFile(CONFIG_PATH, 'utf-8'));
-            } catch (error: any) {
-                if (error.code !== 'ENOENT') throw error;
-            }
-            let mergedConfig: any;
-            try {
-                mergedConfig = mergeConfigSecrets(newConfigData, storedConfig);
-            } catch (error) {
-                if (error instanceof MaskedSecretError) return res.status(400).json({ error: error.message });
-                throw error;
-            }
-
-            const configString = JSON.stringify(mergedConfig, null, 2);
-            await writeFile(CONFIG_PATH, configString, 'utf-8');
+            const saved = await withFileLock(CONFIG_PATH, async () => {
+                const stored = await readWithRevision(CONFIG_PATH);
+                assertFresh(expectedRevision(req), stored.revision);
+                // Masked values from GET mean "keep what's stored": swap them back in.
+                const storedConfig: any = stored.text === null ? {} : JSON.parse(stored.text);
+                const mergedConfig = mergeConfigSecrets(newConfigData, storedConfig);
+                const configString = JSON.stringify(mergedConfig, null, 2);
+                await writeFile(CONFIG_PATH, configString, 'utf-8');
+                return { mergedConfig, revision: revisionOf(configString) };
+            });
             logger.log(`Configuration file updated successfully by admin '${req.session.user?.username}'.`);
-            res.json({ success: true, config: maskConfigSecrets(mergedConfig) });
+            res.setHeader(REVISION_HEADER, saved.revision);
+            res.json({ success: true, config: maskConfigSecrets(saved.mergedConfig) });
         } catch (error) {
+            if (error instanceof MaskedSecretError) return res.status(400).json({ error: error.message });
+            if (error instanceof StaleRevisionError) {
+                logger.warn(`Refused a stale save of ${CONFIG_PATH} by admin '${req.session.user?.username}' (the page's copy is older than the file).`);
+                return res.status(409).json({ error: error.message, code: 'STALE_REVISION' });
+            }
             logger.error(`Error writing config file at ${CONFIG_PATH}:`, error);
             res.status(500).json({ error: 'Failed to write configuration file.' });
         }
@@ -892,17 +902,18 @@ if (enableAdminUI) {
     app.get('/admin/tools/config', isAuthenticated, async (req, res) => {
         try {
             logger.log("Admin request: GET /admin/tools/config");
-            const toolConfigData = await readFile(TOOL_CONFIG_PATH, 'utf-8');
-            res.setHeader('Content-Type', 'application/json');
-            res.send(toolConfigData);
-        } catch (error: any) {
-            if (error.code === 'ENOENT') {
+            const { text, revision } = await readWithRevision(TOOL_CONFIG_PATH);
+            res.setHeader('Cache-Control', 'no-store');
+            res.setHeader(REVISION_HEADER, revision);
+            if (text === null) {
                  logger.log(`Tool config file ${TOOL_CONFIG_PATH} not found, returning empty config.`);
-                 res.json({ tools: {} });
-            } else {
-                 logger.error(`Error reading tool config file at ${TOOL_CONFIG_PATH}:`, error);
-                 res.status(500).json({ error: 'Failed to read tool configuration file.' });
+                 return res.json({ tools: {} });
             }
+            res.setHeader('Content-Type', 'application/json');
+            res.send(text);
+        } catch (error: any) {
+            logger.error(`Error reading tool config file at ${TOOL_CONFIG_PATH}:`, error);
+            res.status(500).json({ error: 'Failed to read tool configuration file.' });
         }
     });
 
@@ -916,10 +927,18 @@ if (enableAdminUI) {
             }
 
             const configString = JSON.stringify(newToolConfigData, null, 2);
-            await writeFile(TOOL_CONFIG_PATH, configString, 'utf-8');
+            await withFileLock(TOOL_CONFIG_PATH, async () => {
+                assertFresh(expectedRevision(req), (await readWithRevision(TOOL_CONFIG_PATH)).revision);
+                await writeFile(TOOL_CONFIG_PATH, configString, 'utf-8');
+            });
             logger.log(`Tool configuration file updated successfully by admin '${req.session.user?.username}'.`);
+            res.setHeader(REVISION_HEADER, revisionOf(configString));
             res.json({ success: true, message: "Configuration saved. Restart proxy server to apply changes." });
         } catch (error) {
+            if (error instanceof StaleRevisionError) {
+                logger.warn(`Refused a stale save of ${TOOL_CONFIG_PATH} by admin '${req.session.user?.username}' (the page's copy is older than the file).`);
+                return res.status(409).json({ error: error.message, code: 'STALE_REVISION' });
+            }
             logger.error(`Error writing tool config file at ${TOOL_CONFIG_PATH}:`, error);
             res.status(500).json({ error: 'Failed to write tool configuration file.' });
         }
@@ -1036,9 +1055,12 @@ if (enableAdminUI) {
         if (!candidates) return res.status(410).json({ error: 'This preview has expired or belongs to another session; paste the config again.' });
         let imported: string[];
         try {
-            const current = await readServerConfigForImport();
-            imported = applySelections(current.mcpServers, candidates, selections);
-            await writeFile(CONFIG_PATH, JSON.stringify(current, null, 2), 'utf-8');
+            imported = await withFileLock(CONFIG_PATH, async () => {
+                const current = await readServerConfigForImport();
+                const names = applySelections(current.mcpServers, candidates, selections);
+                await writeFile(CONFIG_PATH, JSON.stringify(current, null, 2), 'utf-8');
+                return names;
+            });
             dropPreview(previewId);
             logger.log(`Admin '${req.session.user?.username}' imported backend(s): ${imported.join(', ')}`);
         } catch (error: any) {
@@ -1137,6 +1159,8 @@ if (enableAdminUI) {
     app.get('/admin/tool-policy', isAuthenticated, async (req, res) => {
         try {
             const raw = await readPolicyFile();
+            res.setHeader('Cache-Control', 'no-store');
+            res.setHeader(REVISION_HEADER, revisionOf(raw));
             res.json({ exists: raw !== null, policy: raw === null ? null : JSON.parse(raw) });
         } catch (error: any) {
             // Unparseable on disk (hand edit): return the text so it can be fixed.
@@ -1151,13 +1175,23 @@ if (enableAdminUI) {
         } catch (error: any) {
             return res.status(400).json({ error: `Invalid tool policy: ${error?.message || error}` });
         }
+        let revision: string;
         try {
-            await writePolicyFile(req.body);
+            revision = await withFileLock(TOOL_POLICY_PATH, async () => {
+                assertFresh(expectedRevision(req), revisionOf(await readPolicyFile()));
+                await writePolicyFile(req.body);
+                return revisionOf(await readPolicyFile());
+            });
         } catch (error: any) {
+            if (error instanceof StaleRevisionError) {
+                logger.warn(`Refused a stale save of ${TOOL_POLICY_PATH} by admin '${req.session.user?.username}' (the page's copy is older than the file).`);
+                return res.status(409).json({ error: error.message, code: 'STALE_REVISION' });
+            }
             logger.error('Error writing tool policy:', error?.message || error);
             return res.status(500).json({ error: 'Failed to write tool policy file.' });
         }
         logger.log(`Admin '${req.session.user?.username}' updated the tool policy (${TOOL_POLICY_PATH}).`);
+        res.setHeader(REVISION_HEADER, revision);
         res.json({ success: true });
     });
 
@@ -1619,7 +1653,7 @@ if (enableAdminUI) {
         broadcastAdminSse('tool_pins_changed', { pending: 'pending' in s ? s.pending.length : 0 });
     });
 
-    // A root shell in the browser: opt-in. When off, /admin/terminal/* is not
+    // A shell in the browser (as the service user): opt-in. When off, /admin/terminal/* is not
     // mounted and the terminal module (and node-pty) is never loaded.
     if (adminFeatures.terminal) {
         terminalModule = await import('./terminal.js');
@@ -1641,6 +1675,19 @@ if (enableAdminUI) {
 } else if (!adminUIRequested) {
      logger.log("Admin UI is DISABLED. Set ENABLE_ADMIN_UI=true to enable.");
 } // End of the main if (enableAdminUI) block
+
+// Readiness: 200 while every *required* backend is up (mcp_server.json
+// `required`; default true, false for lazy backends), else 503. Always mounted,
+// like /healthz, which stays liveness-only. Mounted after the admin session
+// middleware so it can tell an admin apart: without an admin session it gives
+// counts only, never a backend name; with one it also lists the backends that
+// are not up (never their last error, which can name hosts and paths).
+app.get('/readyz', (req, res) => {
+    const { ready, initialized, required, optional, notUp } = getReadiness();
+    const admin = Boolean((req as any).session?.user);
+    res.set('Cache-Control', 'no-store').status(ready ? 200 : 503)
+        .json({ ready, initialized, required, optional, ...(admin ? { notUp } : {}) });
+});
 
 
 app.get("/sse", async (req, res) => {

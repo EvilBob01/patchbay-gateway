@@ -28,21 +28,21 @@ import { gatewayError, bareError, stripMcpPrefix } from './mcpErrors.js';
 import { createClients, ConnectedClient, reconnectSingleClient } from './client.js';
 import { logger } from './logger.js';
 import { configPath } from './paths.js';
-import { Config, loadConfig, TransportConfig, isSSEConfig, isStdioConfig, isHttpConfig, ToolConfig, loadToolConfig, DEFAULT_SERVER_TOOLNAME_SEPERATOR } from './config.js';
+import { Config, loadConfig, TransportConfig, isSSEConfig, isStdioConfig, isHttpConfig, ToolConfig, loadToolConfig, DEFAULT_SERVER_TOOLNAME_SEPERATOR, isRequiredConfig, isProbeConfig } from './config.js';
 import * as eventsource from 'eventsource';
 import { readFile } from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { recordToolCall, recordRateLimit, recordToolPinEvent, recordBackendEvent } from './audit.js';
-import { BackendSupervisor, BACKEND_UNAVAILABLE_CODE, unavailableMessage, type BackendStatus, type BackendTransition } from './backendHealth.js';
+import { BackendSupervisor, BACKEND_UNAVAILABLE_CODE, unavailableMessage, replaceLabel, type BackendStatus, type BackendTransition, type ReplaceCause } from './backendHealth.js';
 import { ToolPinStore, PIN_TOOLS_ENABLED, PIN_NEW_BACKENDS, TOOL_PINS_PATH, TOOL_PENDING_REVIEW_CODE, hashDefinition, type PinEvent, type PinSnapshot } from './toolPins.js';
 import { UNKNOWN_IDENTITY, type CallerIdentity } from './identity.js';
 import { currentPolicy, AUTHZ_DENIED_CODE, type AuthzDecision } from './policy.js';
 import { checkTrifecta, configureTrifecta, summarizeClassification, selfCompletingTools, backendKind, TRIFECTA_BLOCKED_CODE, type TrifectaDecision, type TrifectaConfig } from './trifecta.js';
 import { buildCollapsePlan, renderCollapsedTool, resolveCollapsedCall, shouldCollapseTools, HOST_PARAM, type CollapsePlan } from './collapse.js';
 import { shapeToolResult } from './tool-result.js';
-import { buildLazyIndex, renderActivateTool, renderGatewayTools, activateText, searchText, describeText, isMetaName, gatewayToolName,
+import { buildLazyIndex, isLazyConfig, renderActivateTool, renderGatewayTools, activateText, searchText, describeText, isMetaName, gatewayToolName,
   SEARCH_DEFAULT_K, SEARCH_MAX_K, SEARCH_TIE_CEILING, type LazyIndex, type GatewayAction, type SearchHit } from './lazy.js';
 import { toolTokens, rankBM25, firstSentence } from './tool-search.js';
 import type { CompiledPolicy } from './policy.js';
@@ -182,12 +182,20 @@ function logBackendTransition(t: BackendTransition): void {
         case 'admin-reconnect':
             logger.log(`Backend "${t.backend}": admin reconnect by ${t.admin} ${t.ok ? 'succeeded' : `failed: ${t.error}`}.`);
             break;
+        case 'replacing':
+            logger.log(`Backend "${t.backend}": replacing its connection (${replaceLabel(t.by)}); calls get "reconnecting" until the new one is up.`);
+            break;
+        case 'replaced':
+            logger.log(`Backend "${t.backend}": new connection up after ${(t.ms / 1000).toFixed(1)}s (${replaceLabel(t.by)}).`);
+            break;
     }
 }
 
 const backendHealth = new BackendSupervisor({
-    reconnect: (backend, stillWanted) => reconnectBackend(backend, stillWanted),
+    reconnect: (backend, stillWanted, by) => reconnectBackend(backend, stillWanted, by),
     alive: (backend) => isConnected(currentConnectedClients.find(c => c.name === backend)),
+    probe: (backend, timeoutMs) => probeBackend(backend, timeoutMs),
+    probeEnabled: (backend) => isProbeConfig(currentActiveServersConfig[backend]),
     onTransition: (t, status) => {
         logBackendTransition(t);
         recordBackendEvent(t);
@@ -244,7 +252,8 @@ function watchClient(cc: ConnectedClient): void {
         if (retiring.has(c)) return;
         // Only the backend's current connection counts; a replaced one is history.
         if (currentConnectedClients.find(x => x.name === cc.name) !== cc) return;
-        backendHealth.reportDown(cc.name, cc.transportType === 'stdio' ? 'stdio process exited' : `${cc.transportType} transport closed`);
+        backendHealth.reportDown(cc.name, cc.transportType === 'stdio' ? 'stdio process exited' : `${cc.transportType} transport closed`,
+            cc.transportType === 'stdio' ? 'exit' : 'transport');
     };
     c.onerror = (e: any) => { logger.debug(`Backend "${cc.name}" transport error: ${e?.message || e}`); };
 }
@@ -258,7 +267,7 @@ const isConnected = (c: ConnectedClient | undefined): boolean => !!c && c.client
  */
 function markConnected(c: ConnectedClient): void {
     backendHealth.markUp(c.name);
-    if (!isConnected(c)) backendHealth.reportDown(c.name, 'exited right after connecting');
+    if (!isConnected(c)) backendHealth.reportDown(c.name, 'exited right after connecting', 'exit');
 }
 
 /** Clients whose backend is up: the ones worth sending a request to. */
@@ -269,7 +278,8 @@ function backendUnavailableError(backend: string): McpError | undefined {
     if (backendHealth.isUp(backend)) return undefined;
     const s = backendHealth.status(backend)!;
     return gatewayError(BACKEND_UNAVAILABLE_CODE, unavailableMessage(s, Math.round(backendHealth.settings.flapWindowMs / 60_000)),
-        { backendUnavailable: { backend, state: s.state, since: s.since, attempt: s.attempt, ...(s.nextRetryAt ? { nextRetryAt: s.nextRetryAt } : {}) } });
+        { backendUnavailable: { backend, state: s.state, since: s.since, attempt: s.attempt, ...(s.nextRetryAt ? { nextRetryAt: s.nextRetryAt } : {}),
+            ...(s.replacing ? { replacing: s.replacing } : {}) } });
 }
 
 /** One backend's served tools, as a string that changes when any of them does. */
@@ -284,10 +294,13 @@ function backendToolSignature(backend: string): string {
  * failure, and then leaves its last-known tools in the map (stable tool lists).
  * `checkStale`: give up if the backend's config changed while connecting.
  * `stillWanted`: the supervisor's check that its attempt is not stale.
+ * `by`: who replaces the connection, if it is a working one (beginReplace:
+ * not up until the caller's markUp after this resolves).
  * Runs under the backend's connection lock, so a fresh connection never
  * replaces another one without retiring it.
  */
-async function connectBackend(serverKey: string, cfg: TransportConfig, checkStale: boolean, stillWanted?: () => boolean): Promise<void> {
+async function connectBackend(serverKey: string, cfg: TransportConfig, checkStale: boolean, stillWanted?: () => boolean,
+    by: ReplaceCause = 'refresh'): Promise<void> {
   await withBackendLock(serverKey, async () => {
     // Checked once the lock is ours: whoever held it may have removed the
     // backend, changed its config or reconnected it already.
@@ -297,7 +310,7 @@ async function connectBackend(serverKey: string, cfg: TransportConfig, checkStal
         throw new Error(`the configuration of "${serverKey}" changed while it was reconnecting`);
     }
     const old = currentConnectedClients.find(c => c.name === serverKey);
-    const parts = await reconnectSingleClient(serverKey, cfg, old ? () => retire(old) : undefined);
+    const parts = await reconnectSingleClient(serverKey, cfg, old ? () => { backendHealth.beginReplace(serverKey, by); return retire(old); } : undefined);
     const fresh: ConnectedClient = { ...parts, name: serverKey };
     if (!currentActiveServersConfig[serverKey]
         || (checkStale && stableConfigString(currentActiveServersConfig[serverKey]) !== stableConfigString(cfg))) {
@@ -347,10 +360,61 @@ async function connectBackend(serverKey: string, cfg: TransportConfig, checkStal
 }
 
 /** The supervisor's reconnect: the backend's current config, or an error if it was removed. */
-async function reconnectBackend(serverKey: string, stillWanted?: () => boolean): Promise<void> {
+async function reconnectBackend(serverKey: string, stillWanted?: () => boolean, by?: ReplaceCause): Promise<void> {
     const cfg = currentActiveServersConfig[serverKey];
     if (!cfg) throw new Error(`backend "${serverKey}" is no longer configured`);
-    await connectBackend(serverKey, cfg, true, stillWanted);
+    await connectBackend(serverKey, cfg, true, stillWanted, by);
+}
+
+// Connections whose backend answered ping with "method not found": probed with tools/list instead.
+const pingUnsupported = new WeakSet<object>();
+
+/**
+ * One health probe (backendHealth.ts): an MCP ping to the backend's current
+ * connection, or tools/list where ping is not supported. True when it
+ * answered; false when it was skipped because a reconnect, reload or pin
+ * re-check holds the backend's connection lock (a probe never waits for one,
+ * and never runs alongside one), or the backend has no live connection.
+ * Throws when it did not answer.
+ */
+export async function probeBackend(name: string, timeoutMs: number = backendHealth.settings.probeTimeoutMs): Promise<boolean> {
+    if (backendLocks.has(name) || backendLocks.has(RELOAD_LOCK)) return false;
+    return withBackendLock(name, async () => {
+        const c = currentConnectedClients.find(x => x.name === name);
+        if (!currentActiveServersConfig[name] || !c || !isConnected(c) || !backendHealth.isUp(name)) return false;
+        if (!pingUnsupported.has(c.client)) {
+            try {
+                await c.client.ping({ timeout: timeoutMs });
+                return true;
+            } catch (e: any) {
+                if (e?.code !== -32601) throw e;
+                pingUnsupported.add(c.client);
+            }
+        }
+        await c.client.request({ method: 'tools/list', params: {} }, ListToolsResultSchema, { timeout: timeoutMs });
+        return true;
+    });
+}
+
+// The first config load has finished: before that, readiness is false (a
+// gateway still connecting its backends must not look like "0 of 0 required").
+let initialized = false;
+
+/** Per-backend health in readiness terms: which backends count, which are not up. */
+export function getReadiness() {
+    const required = { up: 0, total: 0 };
+    const optional = { up: 0, total: 0 };
+    const notUp: { backend: string; state: string; required: boolean }[] = [];
+    for (const name of Object.keys(currentActiveServersConfig).sort()) {
+        const req = isRequiredConfig(currentActiveServersConfig[name]);
+        const s = backendHealth.status(name);
+        const up = s ? s.state === 'up' : false;
+        const bucket = req ? required : optional;
+        bucket.total++;
+        if (up) bucket.up++;
+        else notUp.push({ backend: name, state: s?.state ?? 'connecting', required: req });
+    }
+    return { ready: initialized && required.up === required.total, initialized, required, optional, notUp };
 }
 
 /** Per-backend state for the admin API (GET /admin/server/status). */
@@ -359,18 +423,28 @@ export function getBackendStatus() {
     const backends = Object.keys(currentActiveServersConfig).sort().map(name => {
         const s = backendHealth.status(name);
         const client = currentConnectedClients.find(c => c.name === name);
+        const cfg = currentActiveServersConfig[name];
         let tools = 0;
         for (const v of toolToClientMap.values()) if (v.client.name === name) tools++;
         return {
-            ...(s ?? { backend: name, state: client ? 'up' : 'reconnecting', since: now, attempt: 0, recentCrashes: 0 }),
-            transport: client?.transportType ?? (currentActiveServersConfig[name] as any).type ?? null,
+            ...(s ?? { backend: name, state: client ? 'up' : 'reconnecting', since: now, attempt: 0, recentCrashes: 0,
+                probe: { enabled: false, consecutiveFailures: 0 } }),
+            transport: client?.transportType ?? (cfg as any).type ?? null,
             tools,
+            required: isRequiredConfig(cfg),
+            lazy: isLazyConfig(cfg),
         };
     });
-    const { baseMs, maxMs, flapMax, flapWindowMs, maxConcurrent } = backendHealth.settings;
+    const { baseMs, maxMs, flapMax, flapWindowMs, maxConcurrent, probeIntervalMs, probeTimeoutMs, probeFailures, probeConcurrency } = backendHealth.settings;
+    const { ready } = getReadiness();
     return {
+        ready,
+        initialized,
         backends,
-        settings: { reconnectBaseMs: baseMs, reconnectMaxMs: maxMs, flapMax, flapWindowMin: Math.round(flapWindowMs / 60_000), reconnectConcurrency: maxConcurrent },
+        settings: {
+            reconnectBaseMs: baseMs, reconnectMaxMs: maxMs, flapMax, flapWindowMin: Math.round(flapWindowMs / 60_000), reconnectConcurrency: maxConcurrent,
+            probeIntervalS: probeIntervalMs / 1000, probeTimeoutMs, probeFailures, probeConcurrency,
+        },
     };
 }
 
@@ -646,6 +720,11 @@ async function applyBackendConnections(newServerConfig: Config, newToolConfig: T
         if (!newClientKeys.has(s.backend)) backendHealth.forget(s.backend);
     }
 
+    // A working backend replaced here is not up from now until its new
+    // connection and tools are (markConnected below): not ready, and calls get
+    // "reconnecting" instead of reaching the retired connection.
+    for (const c of clientsToReplace) backendHealth.beginReplace(c.name, 'reload');
+
     // 1. Cleanup removed clients
     if (clientsToRemove.length > 0) {
         logger.log(`Cleaning up ${clientsToRemove.length} removed clients...`);
@@ -679,10 +758,7 @@ async function applyBackendConnections(newServerConfig: Config, newToolConfig: T
     // 3. Update the main list
     currentConnectedClients = [...clientsToKeep, ...newlyConnectedClients, ...placeholders];
     logger.log(`Total active clients after update: ${currentConnectedClients.length}`);
-    for (const c of newlyConnectedClients) {
-        watchClient(c);
-        markConnected(c);
-    }
+    for (const c of newlyConnectedClients) watchClient(c);
     for (const key of keysToAdd) {
         if (!connectedNames.has(key)) backendHealth.reportConnectFailed(key, connectFailures.get(key) || 'could not connect');
     }
@@ -705,8 +781,19 @@ async function applyBackendConnections(newServerConfig: Config, newToolConfig: T
             }
         }
     };
+    // A newly connected backend is up only once its tools are loaded.
+    const fresh = new Set(newlyConnectedClients);
     for (const connectedClient of currentConnectedClients) {
-        if (!backendHealth.isUp(connectedClient.name) || !(await loadBackendTools(connectedClient))) keepPrevious(connectedClient);
+        if (fresh.has(connectedClient)) {
+            if (await loadBackendTools(connectedClient)) {
+                markConnected(connectedClient);
+            } else {
+                keepPrevious(connectedClient);
+                backendHealth.reportConnectFailed(connectedClient.name, 'tools/list failed after connecting');
+            }
+        } else if (!backendHealth.isUp(connectedClient.name) || !(await loadBackendTools(connectedClient))) {
+            keepPrevious(connectedClient);
+        }
     }
     toolPins?.endBaseline();
     toolMapVersion++;
@@ -898,7 +985,7 @@ async function probeHttpAfterFailure(c: ConnectedClient, err: any): Promise<McpE
         // removed or replaced it during the ping, and reportDown would then
         // recreate its health record and retry a backend that is gone.
         if (currentConnectedClients.find(x => x.name === c.name) !== c) return backendUnavailableError(c.name);
-        backendHealth.reportDown(c.name, `no answer to ping after a failed call: ${probeError?.message || probeError}`);
+        backendHealth.reportDown(c.name, `no answer to ping after a failed call: ${probeError?.message || probeError}`, 'call');
         return backendUnavailableError(c.name);
     }
 }
@@ -948,6 +1035,7 @@ export const createServer = async () => {
 
   // Perform initial connection and map population
   await updateBackendConnections(initialServerConfig, initialToolConfig);
+  initialized = true;
 
   const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms)); // Define sleep
 

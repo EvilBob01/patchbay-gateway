@@ -8,7 +8,7 @@
 # It populates $INSTALLER_BASE_DIR (default /opt/patchbay-installer-base, or the
 # pre-rename /opt/mcp-proxy-installer-base if only that exists) with:
 #   node/node.exe            portable Windows node (downloaded)
-#   mcp-remote/node_modules  mcp-remote, pre-installed (npm)
+#   mcp-remote/node_modules  mcp-remote (MCP_REMOTE_VERSION, default 0.16.0), pre-installed (npm)
 #   install.ps1 Install.bat README.txt   copied from this repo (version-controlled)
 #
 # The big binaries are NOT committed to git (see .gitignore) -- this script
@@ -16,6 +16,7 @@
 set -euo pipefail
 
 NODE_VERSION="${NODE_VERSION:-v22.23.1}"
+MCP_REMOTE_VERSION="${MCP_REMOTE_VERSION:-0.16.0}"
 if [ -n "${INSTALLER_BASE_DIR:-}" ]; then
   DEST="$INSTALLER_BASE_DIR"
 elif [ ! -d /opt/patchbay-installer-base ] && [ -d /opt/mcp-proxy-installer-base ]; then
@@ -26,7 +27,7 @@ else
 fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "Building installer base at: $DEST (node $NODE_VERSION)"
+echo "Building installer base at: $DEST (node $NODE_VERSION, mcp-remote $MCP_REMOTE_VERSION)"
 mkdir -p "$DEST/node" "$DEST/mcp-remote"
 
 # 1. Windows node.exe
@@ -47,10 +48,10 @@ else
 fi
 
 # 2. mcp-remote (pure JS, no native modules)
-echo "Installing mcp-remote..."
+echo "Installing mcp-remote@$MCP_REMOTE_VERSION..."
 cd "$DEST/mcp-remote"
 [ -f package.json ] || npm init -y >/dev/null 2>&1
-npm install mcp-remote >/dev/null 2>&1
+npm install --save-exact "mcp-remote@$MCP_REMOTE_VERSION" >/dev/null 2>&1
 echo "mcp-remote installed."
 
 # 3. Version-controlled scripts

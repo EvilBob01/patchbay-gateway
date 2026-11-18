@@ -21,6 +21,10 @@
 #      session secret and client token, and an empty backend list.
 #   5. Installs deploy/patchbay-gateway.service, (re)starts it and prints the
 #      admin URL. Generated credentials are printed once, at the end.
+#   6. Writes the admin terminal's sudo rule (--terminal-sudo, default scoped:
+#      restart, status and the journal of this service only). The sudo rule
+#      only takes effect while the terminal is on (PATCHBAY_ENABLE_TERMINAL),
+#      because only then does the unit allow setuid (NoNewPrivileges=false).
 #
 # Re-running upgrades in place (to the latest release, or --version) and keeps
 # the env file and everything in /var/lib/patchbay. Read docs/install.md for
@@ -47,6 +51,10 @@ SOURCE_TARBALL=""       # developer option: install from a local source tarball
 # a while (23 backends: about 40 s). Override with PATCHBAY_READY_TIMEOUT.
 READY_TIMEOUT="${PATCHBAY_READY_TIMEOUT:-180}"
 MARKER=".patchbay-installer"
+TERMINAL_SUDO="scoped"  # scoped | full | none (docs/install.md, Terminal and sudo)
+SUDOERS_FILE="/etc/sudoers.d/patchbay-gateway"
+DROPIN_DIR="/etc/systemd/system/patchbay-gateway.service.d"
+SUDO_DROPIN="$DROPIN_DIR/10-terminal-sudo.conf"
 
 usage() {
   cat <<EOF
@@ -67,6 +75,10 @@ Usage: install.sh [options]
                        tokens, the audit log).
   --from-tarball <f>   Install from a local source tarball instead of cloning
                        (for testing unreleased code).
+  --terminal-sudo <m>  What the admin terminal (when enabled) may do as root:
+                       scoped (default): restart/status/journal of this service;
+                       full: anything, after typing root's password;
+                       none: no sudo at all.
   -h, --help           Show this help.
 EOF
 }
@@ -103,12 +115,14 @@ while [ $# -gt 0 ]; do
     --uninstall) ACTION="uninstall"; shift ;;
     --purge) PURGE=1; shift ;;
     --from-tarball) SOURCE_TARBALL="${2:?--from-tarball needs a file}"; shift 2 ;;
+    --terminal-sudo) TERMINAL_SUDO="${2:?--terminal-sudo needs scoped, full or none}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown option: $1" ;;
   esac
 done
 
 [ -n "$PORT" ] && { [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || die "--port must be a number"; }
+case "$TERMINAL_SUDO" in scoped|full|none) ;; *) die "--terminal-sudo must be scoped, full or none" ;; esac
 # Print $1 as decimal seconds (1-9999), or fail. Zero padding is decimal: bash
 # arithmetic would read "08" as a bad octal number, and "010" as 8.
 ready_timeout_seconds() {
@@ -147,6 +161,9 @@ if [ "$ACTION" = uninstall ]; then
     run systemctl disable --now "$SERVICE" || true
   fi
   [ -f "$UNIT_FILE" ] && run rm -f "$UNIT_FILE"
+  [ -f "$SUDO_DROPIN" ] && run rm -f "$SUDO_DROPIN"
+  [ -d "$DROPIN_DIR" ] && rmdir "$DROPIN_DIR" 2>/dev/null || true
+  [ -f "$SUDOERS_FILE" ] && run rm -f "$SUDOERS_FILE"
   run systemctl daemon-reload
   run rm -rf "$PREFIX" "$PREFIX.previous" "$PREFIX.previous.service"
   if [ "$PURGE" = 1 ]; then
@@ -184,6 +201,12 @@ else
   SOURCE_DESC="$REPO_URL at ${VERSION:-the newest release tag}"
 fi
 
+# Checked here, before anything changes: refusing at step 6 would leave an
+# upgrade half-applied (new code and unit in place, the old process running).
+if [ "$TERMINAL_SUDO" = full ] && ! command -v visudo >/dev/null; then
+  die "--terminal-sudo full needs sudo installed (or use --terminal-sudo scoped or none)"
+fi
+
 say "Patchbay Gateway installer. This will:"
 info "install packages with $PKG: git, curl, ca-certificates, build tools, python3, and Node.js if needed"
 info "create the system user '$SERVICE_USER' (home $DATA_DIR) if it does not exist"
@@ -196,6 +219,7 @@ else
   info "create $DATA_DIR/config/mcp_server.json with no backends"
 fi
 info "install $UNIT_FILE and $([ "$NO_START" = 1 ] && echo "enable" || echo "start") the '$SERVICE' service"
+info "admin terminal sudo: $TERMINAL_SUDO ($SUDOERS_FILE; effective only while PATCHBAY_ENABLE_TERMINAL is on)"
 confirm "Continue?"
 
 # ---- 1. packages and Node.js ----------------------------------------------
@@ -360,6 +384,81 @@ sed -e "s|/opt/patchbay-gateway|$PREFIX|g" \
     -e "s|^User=.*|User=$SERVICE_USER|" -e "s|^Group=.*|Group=$SERVICE_USER|" \
     -e "s|^ExecStart=/usr/bin/node |ExecStart=$NODE_BIN |" \
     "$PREFIX/deploy/patchbay-gateway.service" > "$UNIT_FILE"
+env_value() { sed -n "s/^$1=\(.*\)$/\1/p" "$ENV_FILE" | tail -n1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/" -e 's/[[:space:]]*$//'; }
+
+# ---- 6. admin terminal sudo ---------------------------------------------------
+# The terminal is a shell as $SERVICE_USER. This decides what it may do as root.
+# The unit ships with NoNewPrivileges=true, which blocks sudo (setuid) for the
+# whole service; the drop-in below relaxes that only while the terminal is on.
+SYSTEMCTL_BIN="$(command -v systemctl)"; JOURNALCTL_BIN="$(command -v journalctl || echo /usr/bin/journalctl)"
+write_sudoers() {
+  local tmp="$WORK/sudoers"
+  case "$TERMINAL_SUDO" in
+    scoped) cat > "$tmp" <<EOT
+# Written by scripts/install.sh (--terminal-sudo scoped). The admin terminal
+# runs as $SERVICE_USER; it may restart this service and read its status and
+# journal, nothing else. --no-pager keeps a root pager (and its shell escape)
+# out of reach.
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart $SERVICE, $SYSTEMCTL_BIN --no-pager status $SERVICE, $JOURNALCTL_BIN --no-pager -u $SERVICE -n 200
+EOT
+    ;;
+    full) cat > "$tmp" <<EOT
+# Written by scripts/install.sh (--terminal-sudo full). Unrestricted, but sudo
+# asks for ROOT's password, so a compromised backend cannot escalate silently.
+Defaults:$SERVICE_USER rootpw
+$SERVICE_USER ALL=(ALL:ALL) ALL
+EOT
+    ;;
+  esac
+  visudo -cqf "$tmp" || die "the generated sudoers rule fails visudo -c; nothing installed"
+  run install -m 0440 -o root -g root "$tmp" "$SUDOERS_FILE"
+}
+# Work out the desired state first, then make both managed files match it, so a
+# re-run with other options (or on a box that lost sudo) leaves nothing stale.
+TERMINAL_ON=0
+case "$(env_value PATCHBAY_ENABLE_TERMINAL 2>/dev/null | tr 'A-Z' 'a-z')" in true|1|yes) TERMINAL_ON=1 ;; esac
+WANT_SUDOERS=0; WANT_DROPIN=0
+if [ "$TERMINAL_SUDO" != none ]; then
+  if command -v visudo >/dev/null; then
+    WANT_SUDOERS=1
+    [ "$TERMINAL_ON" = 0 ] || WANT_DROPIN=1
+  else
+    # Only scoped gets here (full without sudo is refused before step 1). The
+    # default must not fail a box without sudo: the terminal then simply has
+    # none, and with no sudo there is nothing to relax NoNewPrivileges for.
+    info "sudo is not installed: the admin terminal will have no sudo (install sudo and re-run for --terminal-sudo scoped)"
+  fi
+fi
+if [ "$WANT_SUDOERS" = 1 ]; then
+  write_sudoers
+elif [ -f "$SUDOERS_FILE" ]; then
+  run rm -f "$SUDOERS_FILE"
+fi
+if [ "$WANT_DROPIN" = 1 ]; then
+  run mkdir -p "$DROPIN_DIR"
+  if [ "$TERMINAL_SUDO" = full ]; then
+    # Root in the terminal is real root: lift the filesystem sandbox too.
+    cat > "$SUDO_DROPIN" <<EOT
+# Written by scripts/install.sh: the terminal is on with --terminal-sudo full.
+[Service]
+NoNewPrivileges=false
+ProtectSystem=no
+ReadWritePaths=
+EOT
+  else
+    cat > "$SUDO_DROPIN" <<EOT
+# Written by scripts/install.sh: the terminal is on with --terminal-sudo scoped.
+[Service]
+NoNewPrivileges=false
+ReadWritePaths=-/run/sudo
+EOT
+  fi
+  info "terminal is on: $SUDO_DROPIN allows sudo ($TERMINAL_SUDO)"
+elif [ -f "$SUDO_DROPIN" ]; then
+  run rm -f "$SUDO_DROPIN"
+fi
+[ "$TERMINAL_SUDO" != full ] || info "--terminal-sudo full: sudo asks for root's password; set one with 'passwd root' if this box has none"
+
 # SELinux: the code was moved here from /tmp and keeps its tmp label; relabel
 # everything this script wrote to the policy defaults.
 if command -v selinuxenabled >/dev/null && selinuxenabled && command -v restorecon >/dev/null; then
@@ -367,7 +466,6 @@ if command -v selinuxenabled >/dev/null && selinuxenabled && command -v restorec
 fi
 run systemctl daemon-reload
 
-env_value() { sed -n "s/^$1=\(.*\)$/\1/p" "$ENV_FILE" | tail -n1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/" -e 's/[[:space:]]*$//'; }
 PORT_NOW="$(env_value PORT | grep -E '^[0-9]+$' || true)"; PORT_NOW="${PORT_NOW:-3663}"
 # Probe the address the gateway actually listens on: BIND_HOST when it names one
 # address, loopback when it is unset or a wildcard.

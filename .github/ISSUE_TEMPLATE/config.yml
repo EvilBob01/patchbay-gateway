@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Ask for help
+    url: https://github.com/EvilBob01/patchbay-gateway/discussions
+    about: Setup questions and troubleshooting are welcome in Discussions.
+  - name: Share your setup or explore an idea
+    url: https://github.com/EvilBob01/patchbay-gateway/discussions
+    about: Tell us what you connected, what worked, or what you would like to do next.

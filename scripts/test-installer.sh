@@ -19,6 +19,11 @@
 #      installer must wait for it instead of reporting failure after 30 s
 #   4. forced-failure upgrade: the installer fails and prints a rollback command;
 #      running it restores the old code AND the old systemd unit, service running
+#   4b. --terminal-sudo scoped/full/none with the terminal on and off: the sudoers
+#      rule, the unit drop-in, what patchbay may run, ProtectSystem=strict; on a box
+#      without sudo, full is refused before anything changes and scoped carries on
+#   4c. re-runs reconcile the sudo files: full -> scoped replaces both; after sudo
+#      is removed, a re-run from full or scoped removes the rule and the drop-in
 #   5. default release tag skips a prerelease (local bare repo: v1.0.0, v1.1.0-rc1)
 #   6. uninstall --purge leaves nothing behind
 # Installer output goes to files under $LOG_DIR with credential lines removed;
@@ -127,6 +132,68 @@ check "service is active after rollback" bash -c 'for i in 1 2 3 4 5 6 7 8 9 10;
 check "/healthz answers after rollback" wait_http "http://127.0.0.1:$(port)/healthz"
 check "the unit is restored (marker is back)" grep -q 'pre-upgrade marker' "$UNIT"
 check "the code is the previous tree" test "$(cat "$PREFIX/.patchbay-installer")" = "$OLD_MARKER"
+
+echo "== 4b. admin terminal sudo modes and the unit sandbox"
+SUDOERS=/etc/sudoers.d/patchbay-gateway
+DROPIN=/etc/systemd/system/patchbay-gateway.service.d/10-terminal-sudo.conf
+install_sudo() { if command -v apt-get >/dev/null; then apt-get install -y -qq sudo >/dev/null 2>&1; else dnf install -y -q sudo >/dev/null 2>&1; fi; }
+# Debian refuses to remove sudo from a box whose root has no password unless forced.
+remove_sudo() { if command -v apt-get >/dev/null; then SUDO_FORCE_REMOVE=yes apt-get remove -y -qq sudo >/dev/null 2>&1; else dnf remove -y -q sudo >/dev/null 2>&1; fi; }
+active() { local i; for i in $(seq 1 20); do systemctl is-active --quiet patchbay-gateway && return 0; sleep 1; done; return 1; }
+check "the unit runs with ProtectSystem=strict" test "$(systemctl show -p ProtectSystem --value patchbay-gateway)" = strict
+check "the service runs as patchbay" test "$(systemctl show -p User --value patchbay-gateway)" = patchbay
+if ! command -v visudo >/dev/null; then
+  OLD_MARKER="$(cat "$PREFIX/.patchbay-installer")"
+  run_installer sudo-missing-full --from-tarball "$TARBALL" --terminal-sudo full; rc=$?
+  check "no sudo: --terminal-sudo full is refused" bash -c "[ $rc != 0 ] && grep -q 'needs sudo installed' $LOG_DIR/sudo-missing-full.log"
+  check "no sudo: the refusal changed nothing (same code, still running)" bash -c "[ \"\$(cat $PREFIX/.patchbay-installer)\" = '$OLD_MARKER' ] && systemctl is-active --quiet patchbay-gateway"
+  run_installer sudo-missing --from-tarball "$TARBALL"; rc=$?
+  check "no sudo: scoped (the default) carries on" bash -c "[ $rc = 0 ] && grep -q 'sudo is not installed' $LOG_DIR/sudo-missing.log && [ ! -e $SUDOERS ]"
+  install_sudo
+fi
+check "sudo is installed for the remaining checks" command -v visudo
+set_env PATCHBAY_ENABLE_TERMINAL true
+run_installer sudo-scoped --from-tarball "$TARBALL"; rc=$?
+check "scoped, terminal on: installer exits 0" test "$rc" = 0
+check "scoped: the rule passes visudo -c" visudo -cqf "$SUDOERS"
+check "scoped: NOPASSWD allowlist, no blanket rule" bash -c "grep -q NOPASSWD $SUDOERS && ! grep -q 'ALL=(ALL:ALL) ALL' $SUDOERS"
+check "scoped: the drop-in relaxes NoNewPrivileges" grep -q '^NoNewPrivileges=false' "$DROPIN"
+check "scoped: the service is active with the drop-in" active
+check "scoped: patchbay may read the service status" runuser -u patchbay -- sudo -n "$(command -v systemctl)" --no-pager status patchbay-gateway
+check "scoped: patchbay may not run anything else" bash -c "! runuser -u patchbay -- sudo -n true 2>/dev/null"
+run_installer sudo-full --from-tarball "$TARBALL" --terminal-sudo full; rc=$?
+check "full: installer exits 0" test "$rc" = 0
+check "full: rootpw + unrestricted rule, passes visudo -c" bash -c "grep -q '^Defaults:patchbay rootpw' $SUDOERS && grep -q '^patchbay ALL=(ALL:ALL) ALL' $SUDOERS && visudo -cqf $SUDOERS"
+check "full: the drop-in lifts the sandbox" grep -q '^ProtectSystem=no' "$DROPIN"
+check "full: the service is active" active
+check "full: sudo asks for a password" bash -c "! runuser -u patchbay -- sudo -n true 2>/dev/null"
+run_installer sudo-none --from-tarball "$TARBALL" --terminal-sudo none; rc=$?
+check "none: installer exits 0, no rule and no drop-in" bash -c "[ $rc = 0 ] && [ ! -e $SUDOERS ] && [ ! -e $DROPIN ]"
+check "none: the service is active" active
+set_env PATCHBAY_ENABLE_TERMINAL ""
+run_installer sudo-off --from-tarball "$TARBALL"; rc=$?
+check "terminal off: scoped rule written, no drop-in, sandbox back to strict" bash -c "[ $rc = 0 ] && [ -f $SUDOERS ] && [ ! -e $DROPIN ] && [ \"\$(systemctl show -p ProtectSystem --value patchbay-gateway)\" = strict ]"
+check "terminal off: the service is active" active
+
+echo "== 4c. re-runs reconcile the sudo files"
+set_env PATCHBAY_ENABLE_TERMINAL true
+run_installer sudo-full-again --from-tarball "$TARBALL" --terminal-sudo full; rc=$?
+check "full, terminal on: full rule and full drop-in" bash -c "[ $rc = 0 ] && grep -q rootpw $SUDOERS && grep -q '^ProtectSystem=no' $DROPIN"
+run_installer sudo-full-to-scoped --from-tarball "$TARBALL" --terminal-sudo scoped; rc=$?
+check "full -> scoped: the scoped rule and drop-in replace the full ones" bash -c "[ $rc = 0 ] && grep -q NOPASSWD $SUDOERS && ! grep -q rootpw $SUDOERS && grep -q '^NoNewPrivileges=false' $DROPIN && ! grep -q ProtectSystem $DROPIN"
+check "full -> scoped: the sandbox is strict again" test "$(systemctl show -p ProtectSystem --value patchbay-gateway)" = strict
+for from in full scoped; do
+  run_installer "sudo-$from-before-removal" --from-tarball "$TARBALL" --terminal-sudo "$from"; rc=$?
+  check "$from, terminal on: rule and drop-in in place" bash -c "[ $rc = 0 ] && [ -f $SUDOERS ] && [ -f $DROPIN ]"
+  remove_sudo
+  check "$from: sudo is removed" bash -c "! command -v visudo"
+  run_installer "sudo-$from-removed" --from-tarball "$TARBALL"; rc=$?
+  check "$from -> no sudo: no rule and no drop-in left" bash -c "[ $rc = 0 ] && [ ! -e $SUDOERS ] && [ ! -e $DROPIN ]"
+  check "$from -> no sudo: NoNewPrivileges on, sandbox strict" bash -c "[ \"\$(systemctl show -p NoNewPrivileges --value patchbay-gateway)\" = yes ] && [ \"\$(systemctl show -p ProtectSystem --value patchbay-gateway)\" = strict ]"
+  check "$from -> no sudo: the service is active" active
+  install_sudo
+done
+set_env PATCHBAY_ENABLE_TERMINAL ""
 
 echo "== 5. default tag skips a prerelease"
 run_installer uninstall-for-tag --uninstall --purge || true

@@ -21,6 +21,15 @@ LogsDirectoryMode=0750
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+# Read-only OS for the service: it writes only its data dir, the log dir
+# (LogsDirectory) and its private /tmp. The admin terminal's sudo needs a
+# drop-in that relaxes NoNewPrivileges (scripts/install.sh --terminal-sudo;
+# docs/install.md, Terminal and sudo).
+ProtectSystem=strict
+ReadWritePaths=/var/lib/patchbay
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
 
 [Install]
 WantedBy=multi-user.target

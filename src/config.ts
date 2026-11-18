@@ -39,7 +39,30 @@ export type TransportConfig = (TransportConfigStdio | TransportConfigSSE | Trans
   lazy?: boolean,
   /** One-line summary shown in the lazy meta-tools' descriptions. */
   description?: string,
+  /**
+   * Readiness counts only required backends (GET /readyz). Default: true, or
+   * false for a lazy backend. An optional backend that is down is reported
+   * separately and does not make the gateway unready.
+   */
+  required?: boolean,
+  /** Periodic MCP-level health probes for this backend (backendHealth.ts). Default: true. */
+  probe?: boolean,
 };
+
+/** A boolean config field written as true/false or "true"/"false"; undefined when absent or unreadable. */
+const configFlag = (v: unknown): boolean | undefined => {
+  if (v === true || v === false) return v;
+  const s = String(v).trim().toLowerCase();
+  return s === 'true' ? true : s === 'false' ? false : undefined;
+};
+
+/** Does readiness wait for this backend? Explicit `required`, else eager = required, lazy = optional. */
+export const isRequiredConfig = (conf: TransportConfig | undefined): boolean =>
+  configFlag(conf?.required) ?? configFlag(conf?.lazy) !== true;
+
+/** Is this backend probed? Only an explicit `"probe": false` turns it off. */
+export const isProbeConfig = (conf: TransportConfig | undefined): boolean =>
+  configFlag(conf?.probe) !== false;
 
 export interface ProxySettings {
   retrySseToolCall?: boolean; // Renamed from retrySseToolCallOnDisconnect

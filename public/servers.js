@@ -3,28 +3,68 @@ const serverListDiv = document.getElementById('server-list');
 // saveConfigButton and saveStatus are obtained within initializeServerSaveListener
 
 // --- Server Configuration Management ---
+// Save replaces the whole file with what this page shows, so it is allowed only
+// while the page shows the result of one complete load, with that load's
+// revision. Loads can overlap (a tab click or an import while one is still
+// running), so each load takes a generation number and only the newest may
+// render, enable Save or report an error; an older load's late result changes
+// nothing.
+let serverLoadGeneration = 0;
+
+function invalidateServerSnapshot() {
+    window.serverConfigRevision = null;
+    setServerSaveEnabled(false);
+}
+
 async function loadServerConfig() {
-    const localSaveStatus = document.getElementById('save-status'); 
+    const localSaveStatus = document.getElementById('save-status');
     if (!localSaveStatus || !serverListDiv) {
         console.error("loadServerConfig: Missing essential DOM elements (saveStatus or serverListDiv).");
-        return; 
+        return;
     }
+    const generation = ++serverLoadGeneration;
+    const isCurrent = () => generation === serverLoadGeneration;
     localSaveStatus.textContent = 'Loading server configuration...';
+    invalidateServerSnapshot();
     try {
         const response = await fetch('/admin/config');
         if (!response.ok) throw new Error(`Failed to fetch server config: ${response.status} ${response.statusText}`);
-        window.currentServerConfig = await response.json(); 
+        // Sent back on Save: the gateway refuses a save from an older copy (409).
+        const revision = response.headers.get('X-Config-Revision');
+        if (!revision) throw new Error('the gateway sent no configuration revision');
+        const config = await response.json();
+        if (!config || typeof config !== 'object' || !config.mcpServers || typeof config.mcpServers !== 'object') {
+            throw new Error('the configuration has no mcpServers object');
+        }
+        if (!isCurrent()) return; // a newer load owns the page
+        window.currentServerConfig = config;
         renderServerConfig(window.currentServerConfig);
+        window.serverConfigRevision = revision;
+        setServerSaveEnabled(true);
         // addInstallButtonListeners is called within renderServerConfig after rendering all entries
         localSaveStatus.textContent = 'Server configuration loaded.';
         window.isServerConfigDirty = false; // Reset dirty flag after successful load
-        setTimeout(() => { if(localSaveStatus) localSaveStatus.textContent = ''; }, 3000);
+        clearStatusLater(localSaveStatus, 3000);
     } catch (error) {
+        if (!isCurrent()) return; // a newer load owns the page
         console.error("Error loading server config:", error);
+        invalidateServerSnapshot();
         if(localSaveStatus) localSaveStatus.textContent = `Error loading server configuration: ${error.message}`;
         if(serverListDiv) serverListDiv.innerHTML = '<p class="error-message">Could not load server configuration.</p>';
     }
 }
+
+function setServerSaveEnabled(on) {
+    const button = document.getElementById('save-config-button');
+    if (button) button.disabled = !on;
+}
+
+// Why a Save must not run now, or '' when it may: the page must show a config it
+// loaded completely (see loadServerConfig).
+function serverSaveBlockedReason() {
+    return window.serverConfigRevision ? '' : 'The server configuration has not loaded, so this page has nothing it can safely save. Reload the page.';
+}
+window.serverSaveBlockedReason = serverSaveBlockedReason;
 
 function renderServerConfig(config) {
     if (!serverListDiv) return; 
@@ -62,11 +102,27 @@ async function loadBackendStatus() {
         const s = byName.get(entry.dataset.serverKey);
         entry.dataset.backendState = s ? s.state : 'inactive';
         badge.className = 'backend-state' + (s ? ` backend-state-${s.state}` : '');
+        const req = entry.querySelector('.backend-required');
+        if (req) {
+            req.textContent = s ? (s.required ? 'required' : 'optional') : '';
+            req.className = 'backend-required' + (s && !s.required ? ' backend-optional' : '');
+            req.title = s ? (s.required ? 'Readiness (/readyz) waits for this backend' : 'Optional: reported separately, does not make the gateway unready') : '';
+        }
         if (!s) { badge.textContent = ''; badge.title = ''; return; }
-        badge.textContent = s.state === 'up' ? '' : s.state === 'failed' ? 'failed' : `reconnecting (attempt ${Math.max(1, s.attempt)})`;
+        const replacing = { reload: 'config reload', admin: 'admin reconnect', refresh: 'connection refresh' }[s.replacing];
+        badge.textContent = s.state === 'up' ? '' : s.state === 'failed' ? 'failed'
+            : replacing ? `reconnecting (${replacing})` : `reconnecting (attempt ${Math.max(1, s.attempt)})`;
+        const p = s.probe || {};
+        const probeLine = !p.enabled ? 'health probe: off'
+            : !p.lastAt ? 'health probe: not yet run'
+            : `health probe ${p.lastOk ? 'ok' : 'FAILED'} at ${new Date(p.lastAt).toLocaleTimeString()}` +
+              (typeof p.lastMs === 'number' ? ` (${p.lastMs} ms)` : '') +
+              (p.consecutiveFailures ? `, ${p.consecutiveFailures} failure(s) in a row` : '') +
+              (!p.lastOk && p.lastError ? `: ${p.lastError}` : '');
         entry.querySelector('.server-header h3').title = badge.title = [
             `${s.state} since ${new Date(s.since).toLocaleString()}`,
             `${s.tools} tool(s)`,
+            probeLine,
             s.recentCrashes ? `${s.recentCrashes} crash(es) in the last ${data.settings?.flapWindowMin ?? '?'} min` : '',
             s.nextRetryAt ? `next try ${new Date(s.nextRetryAt).toLocaleTimeString()}` : '',
             s.lastError ? `last error: ${s.lastError}` : '',
@@ -74,6 +130,15 @@ async function loadBackendStatus() {
     });
 }
 window.loadBackendStatus = loadBackendStatus;
+// State changes arrive as backend_state events; the last-probe details in the
+// tooltips change without one, so refresh them (at most every 10 s) when the
+// pointer moves onto a server header, before its tooltip shows.
+let backendStatusLoadedAt = 0;
+serverListDiv?.addEventListener('mouseover', (e) => {
+    if (!e.target.closest?.('.server-header') || Date.now() - backendStatusLoadedAt < 10_000) return;
+    backendStatusLoadedAt = Date.now();
+    loadBackendStatus();
+});
 
 async function reconnectBackend(key, button) {
     const status = document.getElementById('save-status');
@@ -101,7 +166,10 @@ function renderServerEntry(key, serverConf, startExpanded = false) {
     if (!startExpanded) {
         entryDiv.classList.add('collapsed');
     }
-    entryDiv.dataset.serverKey = key; 
+    entryDiv.dataset.serverKey = key;
+    // Every caller that starts an entry expanded is adding a new one (Add server,
+    // catalog, import, wizard); save() keeps the loaded shape of the others only.
+    if (startExpanded) entryDiv.dataset.newEntry = 'true';
     entryDiv.dataset.installDirManuallyEdited = 'false'; // Initialize flag
 
     let type = serverConf.type;
@@ -130,6 +198,7 @@ function renderServerEntry(key, serverConf, startExpanded = false) {
             <input type="checkbox" class="server-active-input">
         </label>
         <h3><span class="server-display-name"></span> (<span class="server-type"></span>)</h3>
+        <span class="backend-required" title=""></span>
         <span class="backend-state" title=""></span>
         <button type="button" class="reconnect-button" title="Close this backend's connection and connect it again">Reconnect</button>
         <button class="delete-button">Delete</button>
@@ -502,6 +571,11 @@ async function handleInstallClick(serverKey) {
 }
 
 
+// Every backend field the Servers form edits, for any transport. On save these
+// come from the form only; every other field is carried over unchanged.
+const FORM_MANAGED_FIELDS = ['name', 'active', 'type', 'lazy', 'description', 'url', 'apiKey', 'bearerToken',
+    'command', 'args', 'env', 'installDirectory', 'installCommands'];
+
 function initializeServerSaveListener() {
     const localSaveConfigButton = document.getElementById('save-config-button');
     const localServerListDiv = document.getElementById('server-list');
@@ -513,6 +587,14 @@ function initializeServerSaveListener() {
     }
 
     localSaveConfigButton.addEventListener('click', async () => {
+        const blocked = serverSaveBlockedReason();
+        if (blocked) {
+            // A failed or unfinished load: never turn an error page into a file.
+            localSaveStatus.textContent = `Not saved: ${blocked}`;
+            localSaveStatus.style.color = 'red';
+            return;
+        }
+        const generation = serverLoadGeneration; // a load started meanwhile owns the page's state
         localSaveStatus.textContent = 'Saving server configuration...';
         localSaveStatus.style.color = 'orange';
         // POST /admin/config replaces the whole file, so carry over the top-level
@@ -622,6 +704,33 @@ function initializeServerSaveListener() {
             }
 
             if (isValid) {
+                 // Keys this form doesn't edit (required, probe, ...) come from the
+                 // entry as loaded, found by its original key so a rename keeps them.
+                 // The form's own fields always come from the form, so one the admin
+                 // cleared stays cleared.
+                 const loaded = window.currentServerConfig && window.currentServerConfig.mcpServers;
+                 const original = loaded && Object.prototype.hasOwnProperty.call(loaded, entryDiv.dataset.serverKey) ? loaded[entryDiv.dataset.serverKey] : null;
+                 if (original && typeof original === 'object') {
+                     for (const [k, v] of Object.entries(original)) {
+                         if (!FORM_MANAGED_FIELDS.includes(k) && k !== '_originalKey') serverData[k] = v;
+                     }
+                     // An existing entry keeps the shape it was loaded with: a
+                     // managed field it didn't have, whose form value is only the
+                     // default the form shows for it, is left out. Adding it would
+                     // change the entry's config, and the next reload would
+                     // reconnect a backend nobody touched. The type isn't editable
+                     // here, so an entry without one keeps it absent.
+                     const lacks = (k) => entryDiv.dataset.newEntry !== 'true' && !Object.prototype.hasOwnProperty.call(original, k);
+                     const isEmpty = (v) => v == null || (Array.isArray(v) ? v.length === 0 : typeof v === 'object' && Object.keys(v).length === 0);
+                     if (lacks('active') && serverData.active === true) delete serverData.active;
+                     if (lacks('type')) delete serverData.type;
+                     for (const k of ['env', 'args', 'installCommands']) if (lacks(k) && isEmpty(serverData[k])) delete serverData[k];
+                     // The directory field holds a form default unless the admin
+                     // typed in it (installDirManuallyEdited, set by its input
+                     // listener); a value they typed is kept even if it equals the
+                     // default. An empty command list counts as no commands.
+                     if (lacks('installDirectory') && isEmpty(serverData.installCommands) && entryDiv.dataset.installDirManuallyEdited !== 'true') delete serverData.installDirectory;
+                 }
                  newConfig.mcpServers[newKey] = serverData;
                  const header = entryDiv.querySelector('.server-header');
                  if(header) header.style.border = '';
@@ -631,42 +740,53 @@ function initializeServerSaveListener() {
         if (!isValid) {
             localSaveStatus.textContent = `Error: ${errorMsg}`;
             localSaveStatus.style.color = 'red';
-            setTimeout(() => { if(localSaveStatus) localSaveStatus.textContent = ''; localSaveStatus.style.color = 'green'; }, 5000);
+            clearStatusLater(localSaveStatus, 5000, 'green');
             return;
         }
 
         try {
+            const headers = { 'Content-Type': 'application/json', 'X-Config-Revision': window.serverConfigRevision };
             const response = await fetch('/admin/config', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers,
                 body: JSON.stringify(newConfig)
             });
             const result = await response.json();
+            if (response.status === 409) {
+                // Someone else changed the file after this page loaded it. Keep the
+                // message up (no timeout) and leave the edits on screen.
+                localSaveStatus.textContent = `Not saved: ${result.error}`;
+                localSaveStatus.style.color = 'red';
+                return;
+            }
             if (response.ok && result.success) {
                 localSaveStatus.textContent = 'Server configuration saved successfully.';
                 localSaveStatus.style.color = 'green';
-                // The server answers with the saved config re-masked, so freshly
-                // typed secrets don't stay on screen in full.
-                window.currentServerConfig = result.config || newConfig;
-                window.isServerConfigDirty = false; 
-                renderServerConfig(window.currentServerConfig); 
+                if (generation === serverLoadGeneration) {
+                    // The server answers with the saved config re-masked, so freshly
+                    // typed secrets don't stay on screen in full; its revision is now the page's.
+                    window.serverConfigRevision = response.headers.get('X-Config-Revision') || window.serverConfigRevision;
+                    window.currentServerConfig = result.config || newConfig;
+                    window.isServerConfigDirty = false;
+                    renderServerConfig(window.currentServerConfig);
+                }
                 if (typeof window.triggerReload === 'function') {
                     await window.triggerReload(localSaveStatus);
                 } else {
                      console.error("triggerReload function not found.");
                      localSaveStatus.textContent += ' Reload trigger function not found!';
                      localSaveStatus.style.color = 'red';
-                     setTimeout(() => { if(localSaveStatus) localSaveStatus.textContent = ''; localSaveStatus.style.color = 'green'; }, 7000);
+                     clearStatusLater(localSaveStatus, 7000, 'green');
                 }
             } else {
                 localSaveStatus.textContent = `Error saving: ${result.error || response.statusText}`;
                 localSaveStatus.style.color = 'red';
-                 setTimeout(() => { if(localSaveStatus) localSaveStatus.textContent = ''; localSaveStatus.style.color = 'green'; }, 5000);
+                 clearStatusLater(localSaveStatus, 5000, 'green');
             }
         } catch (error) {
             localSaveStatus.textContent = `Network error saving: ${error.message}`;
             localSaveStatus.style.color = 'red';
-             setTimeout(() => { if(localSaveStatus) localSaveStatus.textContent = ''; localSaveStatus.style.color = 'green'; }, 5000);
+             clearStatusLater(localSaveStatus, 5000, 'green');
         }
     });
 }

@@ -55,7 +55,7 @@ network or behind TLS.
 
 Claude Desktop reaches remote MCP servers through
 [`mcp-remote`](https://www.npmjs.com/package/mcp-remote), a small stdio↔HTTP bridge run
-with `npx`. It needs Node.js on the client machine. Add this to
+with `npx`. It needs Node.js 20.18 or later on the client machine. Add this to
 `claude_desktop_config.json` (Settings → Developer → Edit Config):
 
 ```json
@@ -65,7 +65,7 @@ with `npx`. It needs Node.js on the client machine. Add this to
       "command": "npx",
       "args": [
         "-y",
-        "mcp-remote",
+        "mcp-remote@0.16.0",
         "http://gateway.example.com:3663/mcp?key=<token>",
         "--allow-http"
       ]
@@ -74,6 +74,25 @@ with `npx`. It needs Node.js on the client machine. Add this to
 }
 ```
 
+- **Keep the version pinned** (`mcp-remote@0.16.0`, as the Users tab's **Copy
+  Desktop Config** generates it). With a bare `mcp-remote`, `npx` checks npm on every
+  start and installs any newer release over the copy in its cache, so every client
+  runs a release nobody checked. To move to a newer version, change the version in
+  the config. Configs copied before 1.2.0 stay unpinned until they are copied again.
+- **Install it once before the first start.** `npx` has no lock on its cache
+  folder. When two servers start at the same moment and both install `mcp-remote`,
+  the folder can end up without its `mcp-remote` launcher, and it stays broken (see
+  [Checking it works](#checking-it-works)). Claude Desktop starts every server at
+  once, so with two gateway entries this is likely on the first start. Run this
+  once in a terminal first, and again after changing the version:
+
+  ```
+  npx -y mcp-remote@0.16.0
+  ```
+
+  It installs the package and prints a usage line. A pinned version is then reused
+  as installed; a bare `mcp-remote` would reinstall, and risk the same, with every
+  new release.
 - `--allow-http` is required while the gateway is plain HTTP; `mcp-remote` refuses
   non-HTTPS URLs otherwise. Drop it if a TLS proxy fronts the gateway and use the
   `https://` URL.
@@ -85,7 +104,7 @@ with `npx`. It needs Node.js on the client machine. Add this to
   value has no spaces, so this form works on Windows too:
 
   ```json
-  "args": ["-y", "mcp-remote", "http://gateway.example.com:3663/mcp",
+  "args": ["-y", "mcp-remote@0.16.0", "http://gateway.example.com:3663/mcp",
            "--allow-http", "--header", "X-Api-Key:<token>"]
   ```
 
@@ -124,8 +143,8 @@ sudo -u patchbay env INSTALLER_BASE_DIR=/var/lib/patchbay/installer-base bash in
 ```
 
 This downloads a Windows Node.js build (`NODE_VERSION`, default `v22.23.1`), installs
-`mcp-remote`, and copies the scripts. Re-run it to pick up new versions. Until it has
-run, **Download Installer** answers `503`.
+`mcp-remote` (`MCP_REMOTE_VERSION`, default `0.16.0`), and copies the scripts. Re-run
+it to pick up new versions. Until it has run, **Download Installer** answers `503`.
 
 ## Claude Code
 
@@ -177,6 +196,13 @@ client, ask the admin to set `"mergeTextContent": true` on your user (or
   | `-32011` | Rate limited. Wait the number of seconds in the message. |
   | HTTP `401` | Token missing, mistyped or revoked. |
 
+- **Windows: `'mcp-remote' is not recognized as an internal or external command`**
+  in the Claude Desktop log, for every gateway at once. `npx`'s cache folder for
+  `mcp-remote` is damaged: the package is there, but `node_modules\.bin` has no
+  `mcp-remote.cmd`. `npx` doesn't repair it. Quit Claude Desktop, find the folder
+  under `%LOCALAPPDATA%\npm-cache\_npx\` whose `package.json` lists `mcp-remote` and
+  whose `node_modules\.bin` lacks `mcp-remote.cmd`, delete that one folder, and
+  run `npx -y mcp-remote@0.16.0` once in a terminal before starting Claude again.
 - Admins can see every call in the audit log
   (`$MCP_AUDIT_DIR/tools-call-YYYY-MM-DD.jsonl`), and connection attempts in
   `journalctl -u patchbay-gateway`.

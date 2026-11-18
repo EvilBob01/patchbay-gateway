@@ -66,7 +66,8 @@ const listChanged = (s) => s.transport.notifications.filter(n => n.msg.method ==
 
 test('every backend starts up', () => {
   for (const b of ['web01', 'web02', 'flappy', 'lazyb']) assert.equal(state(b).state, 'up', b);
-  assert.deepEqual(P.getBackendStatus().settings, { reconnectBaseMs: 100, reconnectMaxMs: 400, flapMax: 3, flapWindowMin: 1, reconnectConcurrency: 3 });
+  assert.deepEqual(P.getBackendStatus().settings, { reconnectBaseMs: 100, reconnectMaxMs: 400, flapMax: 3, flapWindowMin: 1, reconnectConcurrency: 3,
+    probeIntervalS: 30, probeTimeoutMs: 10_000, probeFailures: 3, probeConcurrency: 4 });
 });
 
 test('a killed backend: explicit error while down, tools stay listed, then it is respawned', async () => {

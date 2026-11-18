@@ -156,7 +156,7 @@ async function triggerReload(statusElement) {
         statusElement.textContent = `Save successful, but network error during reload: ${errorMessage}`;
         statusElement.style.color = 'red';
     } finally {
-         setTimeout(() => { if(statusElement) { statusElement.textContent = ''; statusElement.style.color = 'green'; } }, 7000);
+         clearStatusLater(statusElement, 7000, 'green');
     }
 }
 window.triggerReload = triggerReload;
@@ -273,6 +273,7 @@ const handleLoginSuccess = async () => {
     }
     // Before the server list renders: it decides whether to show Install buttons.
     await loadAdminFeatures();
+    applyFeedbackVersion();
 
     showSection('servers-section');
     if (typeof loadServerConfig === 'function') {
@@ -407,6 +408,25 @@ function handleParseConfigExecute() {
 // Identify this gateway on the page (incl. the login screen, before auth) so an
 // admin with several IP-only tabs open can tell them apart. Sets the browser tab
 // title, the header text, and an optional accent color.
+// After login: put the release version into the feedback links. Only the
+// version goes in; GitHub shows an editable draft and never submits on its own.
+async function applyFeedbackVersion() {
+    try {
+        const r = await fetch('/admin/version');
+        if (!r.ok) return;
+        const { version } = await r.json();
+        if (typeof version !== 'string') return;
+        for (const id of ['report-problem-link', 'suggest-feature-link']) {
+            const link = document.getElementById(id);
+            if (!link) continue;
+            const url = new URL(link.href);
+            url.searchParams.set('version', version);
+            link.href = url.href;
+        }
+    } catch (_) { /* links still work without the version */ }
+}
+window.applyFeedbackVersion = applyFeedbackVersion;
+
 async function applyGatewayBranding() {
     try {
         const r = await fetch('/admin/info');
@@ -513,7 +533,7 @@ document.addEventListener('DOMContentLoaded', () => {
              const newKey = `new_stdio_server_${Date.now()}`;
              const newServerConf = {
                  type: "stdio", // Specify type
-                 name: "New Stdio Server", active: true, command: "npx", args: ["ssh-mcp", "-y", "--", "--host=CHANGEME", "--port=22", "--user=CHANGEME", `--key=${window.gatewaySshKeyPath || "CHANGEME"}`, "--maxChars=none", "--timeout=600000", "--group=staging", "--disableApproval"], env: {},
+                 name: "New Stdio Server", active: true, command: "npx", args: ["-y", "ssh-mcp@2.19.0", "--", "--host=CHANGEME", "--port=22", "--user=CHANGEME", `--key=${window.gatewaySshKeyPath || "CHANGEME"}`, "--maxChars=none", "--timeout=600000", "--group=staging", "--disableApproval"], env: {},
                  installDirectory: `${window.effectiveToolsFolder || 'tools'}/${newKey}`
              };
              window.renderServerEntry(newKey, newServerConf, true);

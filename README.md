@@ -1,12 +1,18 @@
 # Patchbay Gateway
 
-**One MCP endpoint for all your MCP servers, with identity, per-tool authorization,
-lethal-trifecta blocking and an audit trail in front of every tool call.**
+**Connect your MCP servers once. Give each client one endpoint, and see who called what.**
+
+Running several MCP servers across a home network or small team? Patchbay puts them behind
+one self-hosted endpoint, with personal tokens, per-tool access rules and an audit
+trail. Import an existing client configuration instead of rebuilding it by hand.
+
+**Start here:** [try it locally](#quick-start), [run the simulated demo](docs/demo.md),
+or [report what got in your way](CONTRIBUTING.md). No real servers are needed for the demo.
 
 Patchbay Gateway is a self-hosted [Model Context Protocol](https://modelcontextprotocol.io)
 gateway. It connects to any number of MCP servers (stdio, SSE or streamable HTTP),
 publishes all of their tools behind a single `/mcp` endpoint, and decides *per caller*
-and *per session* which of those tools may run. It is a fork of
+and *per session* which of those tools may run. It is based on
 [ptbsare/mcp-proxy-server](https://github.com/ptbsare/mcp-proxy-server); see
 [Credits](#credits-and-license) and the [CHANGELOG](CHANGELOG.md) for what the fork adds.
 
@@ -263,19 +269,34 @@ curl -fsSL https://raw.githubusercontent.com/EvilBob01/patchbay-gateway/main/scr
 It ends by printing the admin URL and the generated admin password and client token,
 once. Re-run it to upgrade; `--uninstall` removes it.
 
-**To try it on your own machine** (Node.js 20+):
+**To try it on your own machine** (Git and Node.js 20+, Linux, macOS or Windows):
 
 ```bash
-npx patchbay-gateway
+git clone --branch v1.2.0 --single-branch https://github.com/EvilBob01/patchbay-gateway.git
+cd patchbay-gateway
+npm ci --ignore-scripts
+npm run build
+node build/cli.js --host 127.0.0.1
 ```
 
 This keeps everything in `~/.patchbay-gateway`, listens on `127.0.0.1:3663` only, and
-prints a generated admin login on first run. *(The npm package is not published yet;
-until it is, clone the repository and run `npm install && node build/cli.js`.)*
+prints a generated admin login on first run. Open `http://127.0.0.1:3663/admin`.
+The npm package is not published; use these source commands. In Windows PowerShell,
+use `npm.cmd` if execution policy blocks `npm`.
+
+This source install skips optional native-module compilation. The browser terminal
+is off by default; see [installation options](docs/install.md) if you need it.
+Existing environment variables still apply; use a fresh shell for a first trial.
 
 Then open `/admin`, use **Import from client config** on the Servers tab to bring over
 the servers from your `claude_desktop_config.json`, create a user in the **Users** tab,
-and point a client at `http://<host>:3663/mcp?key=<token>`.
+and point a local client at `http://127.0.0.1:3663/mcp` with
+`Authorization: Bearer <token>`. [Client setup](docs/client-setup.md) covers clients
+that need a bridge. A successful first call appears in the audit log.
+
+Stop the local gateway with Ctrl+C. Its data stays in `~/.patchbay-gateway` for
+your next run. To explore without connecting your infrastructure, use the
+[simulated demo](docs/demo.md) from a checkout of v1.2.0 or later.
 
 For a manual deployment (unit file, env file, firewall, upgrades) follow
 **[docs/install.md](docs/install.md)**.
@@ -284,7 +305,9 @@ For a manual deployment (unit file, env file, firewall, upgrades) follow
 
 | Document | Contents |
 |---|---|
-| [docs/install.md](docs/install.md) | One-line installer, `npx` trial, manual native install with systemd, env file, firewall, upgrades |
+| [docs/install.md](docs/install.md) | Server installer, local source trial, manual native install with systemd, env file, firewall, upgrades |
+| [docs/demo.md](docs/demo.md) | Three simulated backends, a smoke check and a short demo recording script |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Report a problem, suggest a feature, or make a small code change |
 | [docs/configuration.md](docs/configuration.md) | Every environment variable, `mcp_server.json`, `users.json`, `tool_policy.json`, rate limits, audit log |
 | [docs/client-setup.md](docs/client-setup.md) | Claude Desktop, Claude Code and other clients via `mcp-remote`; the Windows installer bundle |
 | [TRIFECTA.md](TRIFECTA.md) | The lethal-trifecta model, default classification and the `trifecta` policy section in depth |

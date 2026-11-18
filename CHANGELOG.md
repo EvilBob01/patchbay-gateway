@@ -1,9 +1,124 @@
 # Changelog
 
+## 1.2.0 (2026-11-18)
+
+### Features
+
+- **Admin terminal sudo, chosen at install.** The admin terminal was always a
+  shell as the service user. `scripts/install.sh --terminal-sudo` now decides
+  what it may do as root:
+  - `scoped` (the default): restart this service, and read its status and journal;
+  - `full`: anything, after typing root's password;
+  - `none`: no sudo at all.
+
+  The sudo rule only works while the terminal is on. Only then does the
+  installer add a drop-in that relaxes `NoNewPrivileges`. Every run reconciles
+  both files with the chosen mode, the terminal setting and whether sudo is
+  installed: `none`, or a box without sudo, removes both; terminal off removes
+  the drop-in. See [install.md](docs/install.md#terminal-and-sudo).
+- **A tighter unit sandbox.** `deploy/patchbay-gateway.service` adds:
+  - `ProtectSystem=strict`, with `ReadWritePaths=/var/lib/patchbay`. The OS is read-only to the service, apart from its data and log directories;
+  - `RestrictSUIDSGID`, `LockPersonality` and `RestrictRealtime`.
+
+  A manual install that keeps its config in the code directory needs
+  `ReadWritePaths=` for it (install.md).
+- **First-time setup and feedback.** The README leads with the shared-endpoint
+  workflow and uses a pinned source install while npm remains unpublished.
+  `node scripts/demo.mjs` starts a disposable loopback demo with three simulated
+  backends; `--check` verifies aggregation, collapsed routing and authentication.
+  New bug/feature issue forms and contributor guidance welcome incomplete reports.
+  Admin feedback links prefill only the release version in an editable GitHub
+  draft, using the release version from the new `/admin/version`, which needs
+  an admin login (`/admin/info` stays name and colour only).
+- **Health probes.** A backend that stays connected but stops answering MCP is
+  now noticed. Every backend that is up gets an MCP `ping` every 30 s (or
+  `tools/list` if it does not support ping), with a 10 s timeout. After 3 failures
+  in a row it is marked down and goes through the normal reconnect, backoff and
+  flap path; a probe-triggered down counts as a crash. Probes are jittered, at
+  most 4 run at once, they are skipped while a reconnect or reload holds the
+  backend's connection lock, and a backend that is down, failed or removed is not
+  probed. Settings: `MCP_BACKEND_PROBE_INTERVAL_S` (`0` = off),
+  `MCP_BACKEND_PROBE_TIMEOUT_MS`, `MCP_BACKEND_PROBE_FAILURES`,
+  `MCP_BACKEND_PROBE_CONCURRENCY`; `"probe": false` on a backend turns its probe
+  off. See [configuration.md](docs/configuration.md#health-probes-and-readiness).
+- **Required and optional backends, and `GET /readyz`.** A backend's `required`
+  setting in `mcp_server.json` (default `true`, `false` for lazy backends) decides
+  whether readiness waits for it. `GET /readyz` returns 200 when the first config
+  load is done and every required backend is up, else 503. Without an admin
+  session it gives counts only, never backend names; an admin session also gets
+  the names of backends that are not up. `/healthz` is unchanged (liveness only).
+  A backend whose working connection is replaced on purpose (a reload that
+  changes it, an admin reconnect) is `reconnecting` until its new connection and
+  tools are up: `/readyz` is 503 meanwhile if it is required, and calls get
+  `-32013` "reconnecting (config reload)". That is not a crash: no flap count and
+  no `down` line; the audit log has `replacing` and `replaced` lines, and a
+  replacement that fails goes on as `connect-failed` with backoff.
+- **Status API.** `GET /admin/server/status` adds per backend `required`, `lazy`,
+  `replacing` and `probe` (`enabled`, `lastAt`, `lastOk`, `lastMs`, `lastError`,
+  `consecutiveFailures`), and at the top `ready`, `initialized` and the probe
+  settings. The audit log's `event: "backend"` `down` lines gain `cause`
+  (`exit`, `transport`, `call`, `probe`).
+- **Servers tab.** A required / optional badge per backend; the state tooltip
+  shows the last probe's time, result and latency, and a planned replacement shows
+  as "reconnecting (config reload)" or "(admin reconnect)". Saving the tab keeps
+  `required`, `probe` and every other backend field the form doesn't edit, also
+  across a rename. It also no longer adds `active`, `type`, an empty `env`, `args`
+  or `installCommands`, or the default `installDirectory` to an existing entry that
+  didn't have them, so an unchanged save doesn't change the config and make the
+  next reload reconnect backends nobody touched. An install directory the admin
+  typed is saved even when it equals the default. New entries get those defaults
+  as before.
+- **Tests.** `npm test` runs the test files that assert wall-clock bounds on
+  their own, after the rest, so a loaded machine doesn't fail them.
+- **SSH hosts added through the wizard could not upload or run destructive
+  commands.** The Add Server wizard wrote a bare `ssh-mcp` without
+  `--disableApproval`, so a new host started whatever ssh-mcp npm had as latest.
+  Current releases ask the MCP client to confirm destructive and sudo commands and
+  uploads, the gateway doesn't pass that request on, and every such call failed with
+  `APPROVAL_UNAVAILABLE`. The wizard (and the Servers tab's blank SSH template) now
+  write `ssh-mcp@2.19.0` with `--disableApproval`; the Servers tab marks a backend with
+  approval on as a warning and says why. Existing entries are not changed: add
+  `--disableApproval` (the ssh-mcp policy toggle) and a version to any that lack them.
+- **Client config pins `mcp-remote`.** Copy Desktop Config, the docs and the
+  installer build use `mcp-remote@0.16.0` instead of a bare `mcp-remote`. Unpinned,
+  `npx` installed each new release over its cache folder at the next start, so
+  clients ran whatever release npm had that day. `npx` doesn't lock that folder:
+  on a Windows client two gateways starting together left it without its
+  `mcp-remote` launcher, and neither started until the folder was deleted. A pin
+  stops new releases from repeating that; the first install can still collide, so
+  `docs/client-setup.md` now says to run `npx -y mcp-remote@0.16.0` once before
+  the first start, and how to repair a broken folder. The Windows installer bundle
+  doesn't use `npx` and isn't affected. Existing clients keep their config until
+  they copy it again. The installer build takes `MCP_REMOTE_VERSION` (default
+  `0.16.0`).
+
+### Behaviour changes
+
+- Probes are **on by default**. A backend that does not answer a ping within 10 s
+  three times in a row is restarted where before it was left alone. Set
+  `"probe": false` on a backend that should not be probed.
+
 ## 1.1.0 (2026-10-13)
 
 ### Fixes
 
+- **Saving from an outdated admin page no longer undoes newer changes.** The
+  Servers and Tools tabs and the tool policy editor save the whole file from the
+  copy the page loaded, and the gateway wrote it without checking whether the file
+  had changed since. A page left open could undo another admin's save or a hand
+  edit, unseen: a production gateway lost a backend version pin this way. Each load
+  now carries the file's revision (`X-Config-Revision`), the page sends it back,
+  and a save from an older revision is refused with `409` and *Not saved: …*,
+  leaving the file and the page's edits as they were. A tab saves only what it
+  loaded completely: Save is off while loading and after a failed load, and is
+  refused then, so an error page is never saved as an empty file (a failed Tools
+  load used to let Save replace `tool_config.json` with no overrides). When loads
+  overlap (a tab clicked again while loading), only the latest one may show its
+  result or enable Save; an older load's late success or failure changes nothing. A refused
+  save's message is no longer cleared by an older status timer. The gateway's own
+  saves to one file run one at a time. Scripts that send no revision are not
+  checked. See
+  [configuration.md](docs/configuration.md#configmcp_serverjson-backend-servers).
 - **A retry never runs a tool that changed while the call waited.** Authorization
   and tool resolution happened once, before the retry loop; a backend that changed
   a tool's definition and sent `tools/list_changed` during the retry delay had the

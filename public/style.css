@@ -387,6 +387,9 @@ button:disabled, .add-button:disabled { opacity: .55; cursor: not-allowed; }
 .server-entry .server-header button { margin: 0; flex-shrink: 0; }
 /* backend state (GET /admin/server/status): the dot before the name, plus a word when not up */
 .backend-state { font-size: .8rem; white-space: nowrap; flex-shrink: 0; }
+.backend-required { font-size: .7rem; white-space: nowrap; flex-shrink: 0; padding: 0 .4em; border-radius: 999px; border: 1px solid var(--text-muted); color: var(--text-muted); }
+.backend-required:empty { display: none; }
+.backend-optional { border-style: dashed; }
 .backend-state-reconnecting { color: var(--warning); }
 .backend-state-failed { color: var(--danger); font-weight: 600; }
 .server-entry[data-backend-state="reconnecting"] .server-header h3::before { background: var(--warning); box-shadow: 0 0 0 3px var(--warning-soft); }

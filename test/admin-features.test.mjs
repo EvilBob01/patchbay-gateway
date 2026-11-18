@@ -70,6 +70,8 @@ async function startGateway(env, mcpServers = {}) {
     MCP_USERS_PATH: path.join(dir, 'config', 'users.json'),
     MCP_TOOL_POLICY_PATH: path.join(dir, 'config', 'tool_policy.json'),
     MCP_TOOL_PINS_PATH: path.join(dir, 'config', 'tool_pins.json'),
+    // The admin API reads and writes here too, never in the repo's own config/.
+    PATCHBAY_CONFIG_DIR: path.join(dir, 'config'),
     LOGGING: 'info',
     ...env,
   });
@@ -80,7 +82,9 @@ async function startGateway(env, mcpServers = {}) {
   child.stdout.on('data', d => { output += d; });
   child.stderr.on('data', d => { output += d; });
   await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`gateway did not start:\n${output}`)), 20_000);
+    // On failure the caller never gets a stop handle, so kill the child here: a
+    // leaked gateway keeps this test process alive and hangs the whole run.
+    const timer = setTimeout(() => { child.kill(); reject(new Error(`gateway did not start within 60 s:\n${output}`)); }, 60_000);
     const check = () => { if (output.includes('Patchbay Gateway is running')) { clearTimeout(timer); resolve(); } };
     child.stdout.on('data', check);
     child.once('exit', code => { clearTimeout(timer); reject(new Error(`gateway exited (${code}):\n${output}`)); });
@@ -88,10 +92,10 @@ async function startGateway(env, mcpServers = {}) {
 
   const base = `http://127.0.0.1:${port}`;
   let cookie = '';
-  const request = async (method, url, body) => {
+  const request = async (method, url, body, extraHeaders = {}) => {
     const res = await fetch(base + url, {
       method,
-      headers: { ...(cookie ? { cookie } : {}), ...(body !== undefined ? { 'content-type': 'application/json' } : {}) },
+      headers: { ...(cookie ? { cookie } : {}), ...(body !== undefined ? { 'content-type': 'application/json' } : {}), ...extraHeaders },
       body: body !== undefined ? JSON.stringify(body) : undefined,
       redirect: 'manual',
     });
@@ -99,7 +103,7 @@ async function startGateway(env, mcpServers = {}) {
     if (set) cookie = set.split(';')[0];
     let json = null;
     try { json = await res.json(); } catch { /* not JSON */ }
-    return { status: res.status, json };
+    return { status: res.status, json, headers: res.headers };
   };
   const login = (password = PASSWORD) => request('POST', '/admin/login', { username: 'admin', password });
 
@@ -230,6 +234,19 @@ test('/healthz answers {status:"ok"} without credentials, with the admin UI on o
       const r = await gw.request('GET', '/healthz');
       assert.equal(r.status, 200, JSON.stringify(env));
       assert.deepEqual(r.json, { status: 'ok' });
+      if (env.ENABLE_ADMIN_UI === 'true' && env.ADMIN_PASSWORD) {
+        const info = await gw.request('GET', '/admin/info');
+        assert.equal(info.status, 200);
+        assert.deepEqual(Object.keys(info.json).sort(), ['color', 'name'], 'no version before login');
+        const anon = await gw.request('GET', '/admin/version');
+        assert.notEqual(anon.status, 200, 'version needs login');
+        assert.equal(anon.json?.version, undefined);
+        assert.equal((await gw.login()).status, 200);
+        const pkg = JSON.parse(readFileSync(path.join(here, '..', 'package.json'), 'utf-8'));
+        const authed = await gw.request('GET', '/admin/version');
+        assert.equal(authed.status, 200);
+        assert.deepEqual(authed.json, { version: pkg.version });
+      }
       if (env.ENABLE_ADMIN_UI === 'false') assert.equal((await gw.request('GET', '/admin/info')).status, 404);
     } finally { await gw.stop(); }
   }
@@ -248,4 +265,73 @@ test('MCP initialize reports the package.json version', async (t) => {
   const text = await res.text();
   const data = JSON.parse(text.startsWith('{') ? text : text.split('\n').find(l => l.startsWith('data:')).slice(5));
   assert.equal(data.result.serverInfo.version, pkg.version);
+});
+
+// --- Stale-save protection (src/fileRevision.ts) ---
+// The admin UI saves a whole file from the copy it loaded. A page loaded before
+// a hand edit or another admin's save must not undo that change: a production
+// gateway lost a backend version pin to a Save from a page loaded an hour earlier.
+const REV = 'x-config-revision';
+
+test('server config: a save from a copy older than the file is refused (409) and the file is untouched', async (t) => {
+  const gw = await startGateway({ ENABLE_ADMIN_UI: 'true', ADMIN_PASSWORD: PASSWORD });
+  t.after(gw.stop);
+  assert.equal((await gw.login()).status, 200);
+  const file = path.join(gw.dir, 'config', 'mcp_server.json');
+
+  const loaded = await gw.request('GET', '/admin/config');
+  assert.equal(loaded.status, 200, JSON.stringify(loaded.json));
+  const rev1 = loaded.headers.get(REV);
+  assert.match(rev1, /^[0-9a-f]{32}$/);
+
+  // Someone pins a version on the gateway after the page loaded.
+  const pinned = { mcpServers: { box: { type: 'stdio', command: 'npx', args: ['ssh-mcp@2.22.1', '-y', '--'] } } };
+  writeFileSync(file, JSON.stringify(pinned, null, 2));
+
+  // The old page saves its unpinned copy: refused, and the pin survives.
+  const stale = { mcpServers: { box: { type: 'stdio', command: 'npx', args: ['ssh-mcp', '-y', '--'] } } };
+  const refused = await gw.request('POST', '/admin/config', stale, { [REV]: rev1 });
+  assert.equal(refused.status, 409);
+  assert.equal(refused.json.code, 'STALE_REVISION');
+  assert.match(refused.json.error, /Reload the page/);
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf-8')), pinned);
+  assert.match(gw.output(), /Refused a stale save of .*mcp_server\.json/);
+
+  // Reloaded, the page saves fine, and the revision it gets back keeps working.
+  const rev2 = (await gw.request('GET', '/admin/config')).headers.get(REV);
+  assert.notEqual(rev2, rev1);
+  const edited = { mcpServers: { box: { ...pinned.mcpServers.box, active: false } } };
+  const ok = await gw.request('POST', '/admin/config', edited, { [REV]: rev2 });
+  assert.equal(ok.status, 200);
+  const rev3 = ok.headers.get(REV);
+  assert.equal(rev3, (await gw.request('GET', '/admin/config')).headers.get(REV), 'the save returns the new file revision');
+  assert.equal((await gw.request('POST', '/admin/config', edited, { [REV]: rev3 })).status, 200);
+  assert.equal((await gw.request('POST', '/admin/config', edited, { [REV]: rev2 })).status, 409, 'an older revision stays refused');
+
+  // A client that sends no revision (a script) is not checked.
+  assert.equal((await gw.request('POST', '/admin/config', edited)).status, 200);
+});
+
+test('tool config and tool policy: stale saves are refused (409), a missing file has revision "none"', async (t) => {
+  const gw = await startGateway({ ENABLE_ADMIN_UI: 'true', ADMIN_PASSWORD: PASSWORD });
+  t.after(gw.stop);
+  assert.equal((await gw.login()).status, 200);
+
+  for (const [url, body] of [
+    ['/admin/tools/config', { tools: { 'box__run': { enabled: false } } }],
+    ['/admin/tool-policy', { users: { alice: { allow: ['box/*'] } } }],
+  ]) {
+    const first = await gw.request('GET', url);
+    assert.equal(first.status, 200, url);
+    assert.equal(first.headers.get(REV), 'none', `${url}: no file yet`);
+    const saved = await gw.request('POST', url, body, { [REV]: 'none' });
+    assert.equal(saved.status, 200, url);
+    const rev = saved.headers.get(REV);
+    assert.equal(rev, (await gw.request('GET', url)).headers.get(REV), `${url}: the save returns the new revision`);
+    // A second page that also loaded before the first save:
+    const refused = await gw.request('POST', url, body, { [REV]: 'none' });
+    assert.equal(refused.status, 409, `${url}: stale`);
+    assert.equal(refused.json.code, 'STALE_REVISION');
+    assert.equal((await gw.request('POST', url, body, { [REV]: rev })).status, 200, `${url}: current revision`);
+  }
 });

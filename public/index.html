@@ -141,8 +141,11 @@
                 <p>Click <strong>Copy Desktop Config</strong> on any user above to build a
                    ready-to-paste block for their Claude Desktop app
                    (Windows or Mac). Paste it into <em>Settings → Developer →
-                   Edit Config</em>. Their machine needs <strong>Node.js</strong> installed
-                   (<code>node -v</code> to check) and network access to this gateway.</p>
+                   Edit Config</em>. Their machine needs <strong>Node.js</strong> 20.18 or later
+                   (<code>node -v</code> to check) and network access to this gateway.
+                   Before the first start, they run <code>npx -y mcp-remote@0.16.0</code> once
+                   in a terminal: Claude Desktop starts all its servers at once, and two
+                   first-time installs together can break npx's cache.</p>
                 <label for="config-server-name">Server name (how it shows in their app):</label>
                 <input type="text" id="config-server-name" value="patchbay">
                 <label for="generated-config-preview">Generated config:</label>
@@ -418,7 +421,9 @@
                         </select>
                         <p class="wizard-hint">ssh-mcp checks every command against this tier. Without one it
                            assumes <strong>prod</strong>, the strictest. You can change it later in the server's
-                           ssh-mcp policy section.</p>
+                           ssh-mcp policy section. The host runs ssh-mcp 2.19.0 with approval prompts off
+                           (<code>--disableApproval</code>): this gateway can't pass a prompt on to its callers,
+                           so a prompt would refuse the command. The gateway's own policy still applies.</p>
                     </div>
                     <div class="wz-npm-fields" style="display:none;">
                         <label for="wz-npm-package">npm package</label>
@@ -556,7 +561,7 @@ OR
     </main>
 
     <footer>
-        <p>Having issues or suggestions? <a href="https://github.com/EvilBob01/patchbay-gateway/issues" target="_blank" rel="noopener noreferrer">Submit an issue on GitHub</a>.</p>
+        <p><a id="report-problem-link" href="https://github.com/EvilBob01/patchbay-gateway/issues/new?template=bug_report.yml" target="_blank" rel="noopener noreferrer">Report a problem</a> · <a id="suggest-feature-link" href="https://github.com/EvilBob01/patchbay-gateway/issues/new?template=feature_request.yml" target="_blank" rel="noopener noreferrer">Suggest a feature</a>. Only the release version is prefilled. Review your draft on GitHub before posting; leave out tokens, private hosts and raw config.</p>
         <p><a href="https://github.com/EvilBob01/patchbay-gateway" target="_blank" rel="noopener noreferrer">Patchbay Gateway</a>, based on <a href="https://github.com/ptbsare/mcp-proxy-server" target="_blank" rel="noopener noreferrer">MCP Proxy Server</a> by <a href="https://github.com/ptbsare" target="_blank" rel="noopener noreferrer">ptbsare</a></p>
     </footer>
 

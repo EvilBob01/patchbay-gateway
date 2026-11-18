@@ -38,8 +38,9 @@ const MAX_BUFFER_LENGTH = 200; // Max number of lines/chunks to buffer
  * Build the environment handed to a terminal PTY, with this gateway's own
  * secrets removed.
  *
- * The admin terminal is a root shell by design, so this is not a privilege
- * boundary -- an admin can read the service EnvironmentFile directly. What it
+ * The admin terminal is a shell as the service user, with whatever sudo the
+ * install grants it, so this is not a privilege boundary -- with sudo an admin
+ * can read the service EnvironmentFile directly. What it
  * does remove is the *casual* exposure: every `env` dump, every subprocess
  * spawned from the terminal, and every screen-share of this tab would
  * otherwise show ADMIN_PASSWORD, SESSION_SECRET and, more importantly, the

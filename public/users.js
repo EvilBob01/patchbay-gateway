@@ -97,6 +97,12 @@ function renderUserList(users) {
 }
 
 
+// mcp-remote version the generated client config pins. A bare "mcp-remote" makes
+// npx check npm on every launch and update its shared cache folder in place when a
+// new version is out; two servers starting at once can then leave it without its
+// launcher. An exact version is reused from the cache as installed.
+const MCP_REMOTE_SPEC = 'mcp-remote@0.16.0';
+
 // Build the ready-to-paste Claude Desktop config for a given user token.
 // The gateway base URL is derived from whatever address the admin is currently
 // viewing this UI at (window.location) -- so as long as you browse to the admin
@@ -110,7 +116,7 @@ function generateDesktopConfig(token) {
         mcpServers: {
             [serverName]: {
                 command: 'npx',
-                args: ['-y', 'mcp-remote', url, '--allow-http']
+                args: ['-y', MCP_REMOTE_SPEC, url, '--allow-http']
             }
         }
     };
@@ -211,18 +217,43 @@ const TOOL_POLICY_EXAMPLE = {
     users: { 'example-user': { allow: ['some-server/*'] } }
 };
 
+// Save replaces the whole tool_policy.json with the editor's text, so it is
+// allowed only while the editor shows the result of one complete load, with that
+// load's revision ("none" when no policy file exists yet). Loads can overlap, so
+// each takes a generation number and only the newest may fill the editor,
+// enable Save or report an error.
+let toolPolicyLoadGeneration = 0;
+
+function invalidateToolPolicySnapshot() {
+    window.toolPolicyRevision = null;
+    const button = document.getElementById('save-tool-policy-button');
+    if (button) button.disabled = true;
+}
+
 async function loadToolPolicy() {
     const editor = document.getElementById('tool-policy-editor');
     const status = document.getElementById('tool-policy-status');
     if (!editor) return;
+    const generation = ++toolPolicyLoadGeneration;
+    const isCurrent = () => generation === toolPolicyLoadGeneration;
+    const button = document.getElementById('save-tool-policy-button');
+    invalidateToolPolicySnapshot();
     try {
         const response = await fetch('/admin/tool-policy');
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        // Sent back on Save: the gateway refuses a save from an older copy (409).
+        const revision = response.headers.get('X-Config-Revision');
+        if (!revision) throw new Error('the gateway sent no policy revision');
+        if (!isCurrent()) return; // a newer load owns the editor
         editor.value = JSON.stringify(data.exists ? data.policy : TOOL_POLICY_EXAMPLE, null, 2);
+        window.toolPolicyRevision = revision;
+        if (button) button.disabled = false;
         status.style.color = '';
         status.textContent = data.exists ? '' : 'No policy saved: every user has every enabled tool. Edit the example and save to restrict.';
     } catch (error) {
+        if (!isCurrent()) return; // a newer load owns the editor
+        invalidateToolPolicySnapshot();
         status.style.color = 'red';
         status.textContent = `Error loading policy: ${error.message}`;
     }
@@ -231,6 +262,13 @@ async function loadToolPolicy() {
 async function saveToolPolicy() {
     const editor = document.getElementById('tool-policy-editor');
     const status = document.getElementById('tool-policy-status');
+    if (!window.toolPolicyRevision) {
+        // A failed or unfinished load: the editor may hold an older policy, or nothing.
+        status.style.color = 'red';
+        status.textContent = 'Not saved: The tool policy has not loaded, so this page has nothing it can safely save. Reload the page.';
+        return;
+    }
+    const generation = toolPolicyLoadGeneration; // a load started meanwhile owns the editor's state
     let parsed;
     try {
         parsed = JSON.parse(editor.value);
@@ -240,13 +278,22 @@ async function saveToolPolicy() {
         return;
     }
     try {
+        const headers = { 'Content-Type': 'application/json', 'X-Config-Revision': window.toolPolicyRevision };
         const response = await fetch('/admin/tool-policy', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers,
             body: JSON.stringify(parsed)
         });
         const result = await response.json();
+        if (response.status === 409) {
+            status.style.color = 'red';
+            status.textContent = `Not saved: ${result.error}`;
+            return;
+        }
         if (response.ok && result.success) {
+            if (generation === toolPolicyLoadGeneration) {
+                window.toolPolicyRevision = response.headers.get('X-Config-Revision') || window.toolPolicyRevision;
+            }
             status.style.color = 'green';
             status.textContent = 'Policy saved. It applies to the next request.';
         } else {
